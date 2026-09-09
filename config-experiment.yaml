@@ -1,0 +1,310 @@
+# ============================================================
+# EXPERIMENT-ARM CONFIG (epoch x degradation, 2026-08-17).
+# Generated from config.yaml with these changes (extended 2026-08-18 from
+# dinov3-only to ALL branches, for the 5-branch Cycle-23 build):
+#   branches.<each>.epochs: 10   and   use_degradation_schedule: true
+# 10 epochs per branch matches the 10-entry degradation_schedule exactly, so
+# every branch ends on the deploy-faithful finale profile.
+# Baseline/control arm = config.yaml. Do NOT edit either mid-run;
+# regenerate this file if config.yaml changes.
+# ============================================================
+seed: 34
+output_dir: runs/v7
+
+# Branches to train (one `train.py --branch NAME` run each) and to fuse at
+# export. Registry lives in branches.py: dinov3 + clip carry effective fusion
+# weight 1/3 each, convnext + eva 1/6 each (BMF Table 1). export.py
+# renormalises over the subset actually shipped, so shipping two branches is
+# legal and keeps the baked temperature exact.
+# Per-branch overrides for batch_size / grad_accum_steps / lr are honoured by
+# train.py (everything else stays global so runs remain comparable).
+#
+# Tuned 2026-08-11 for the RTX Pro 6000 (96 GB): checkpointing OFF wherever
+# the dual-view activation graphs fit -- the recompute tax is ~30-40% of step
+# time and was only ever paid for the old 32 GB card. Anchor measurement
+# (video_v1, same card class): 256 DINOv3-L@224 graphs fit no-ckpt in 96 GB;
+# the dual-view loss holds 2x batch_size graphs at once.
+branches:
+  dinov3:                       # ViT-L @ 224: 2x96 = 192 graphs, fits free
+    gradient_checkpointing: false
+    batch_size: 96
+    lr: 1.7e-4                  # sqrt-scaled from 1e-4 @ 32
+    # EXPERIMENT ARM: 10 epochs, one degradation profile per epoch
+    epochs: 10
+  # Resolution-bump variants (EXPECTED_OUTCOMES.md D5; branches.py explains
+  # swap semantics). native_size lives in the REGISTRY only -- putting it
+  # here would be silently ignored (validate_config does not inspect
+  # branches: subkeys). LR follows the sqrt rule from the validated
+  # 1e-4 @ 32: lr = 1e-4 * sqrt(bs/32) -> 96: 1.7e-4, 64: 1.4e-4,
+  # 48: 1.2e-4, 32: 1.0e-4.
+  dinov3_336:                   # ViT-L @ 336 = 446 tokens, ~2.2x the 224
+    # 2x96 graphs @ 446 tokens ~= 85.6k token-graphs vs the 51.5k known-fit
+    # anchor (256 @ 224). Plausible-but-tight no-ckpt; OOM ladder in order:
+    #   (1) gradient_checkpointing: true, keep bs 96 / lr 1.7e-4
+    #   (2) bs 64 / lr 1.4e-4, no-ckpt
+    #   (3) bs 48 / lr 1.2e-4, ckpt
+    # A bs change breaks A/B pairing -- rerun the 224 arm at the same bs.
+    gradient_checkpointing: false
+    batch_size: 96
+    lr: 1.7e-4
+    epochs: 10
+  dinov3_384:                   # ViT-L @ 384 = 581 tokens, ~2.9x the 224
+    # 2x96 @ 581 ~= 111.6k token-graphs: no-ckpt will not fit at 96. Ckpt on
+    # (HF path is hardened: non-reentrant + input-require-grads, and the
+    # step-0 dead-grad check aborts if it ever regresses). Fallback if the
+    # recompute tax hurts too much: no-ckpt bs 32-48, lr 1.0-1.2e-4.
+    gradient_checkpointing: true
+    batch_size: 96
+    lr: 1.7e-4
+    epochs: 10
+  clip:                         # ViT-L @ 224: same envelope as dinov3
+    gradient_checkpointing: false
+    batch_size: 96
+    lr: 1.7e-4
+    epochs: 10
+  convnext:                     # ConvNeXt-L @ 384: heavier maps; 2x64 fits
+    gradient_checkpointing: false
+    batch_size: 64
+    lr: 1.4e-4
+    epochs: 10
+  eva:                          # ViT-L @ 448 = 1025 tokens, ~5x the 224
+    gradient_checkpointing: true   # activation envelope -- keep ckpt, keep 64
+    batch_size: 64
+    lr: 1.4e-4
+    epochs: 10
+  # Frequency-forensic branch: resnet18 from scratch over log-DCT spectra of
+  # the full 384 input (no resample in front of it -- branches.py explains).
+  # Tiny (~11M params); checkpointing pointless. Nearly blind to content and
+  # style, which is the point: added after dflip3k reals measured 15% -- the
+  # semantic branches call the whole stylized-real domain fake, and a
+  # spectral vote is the structural counterweight (BMF section 3.3).
+  dct:
+    gradient_checkpointing: false
+    batch_size: 256             # scratch net, wants the big batch
+    lr: 3.0e-4
+    epochs: 10                  # scratch net was the most undertrained at 2
+
+data:
+  manifest: data/manifest.parquet
+  # The DECLARED submission resolution (model_config.yaml preprocessing.resize)
+  # and therefore the size every training view is rendered at. 384 is BMF's
+  # production design point; each branch downsamples internally to its native
+  # size (dinov3 224 / clip 224 / convnext 384 / eva 448 / dct 384) with
+  # antialiased bilinear, identically at train and eval. 4-branch core
+  # ~700 GFLOPs -- 2.7x cheaper than one DINOv3-L at 768; a dinov3_336 swap
+  # adds ~80 GFLOPs, dinov3_384 ~125 (ViT-L/16: ~62 @224, ~140 @336,
+  # ~187 @384).
+  image_size: 384
+  # The view pipeline (JPEG/WebP laundering roundtrips, resample jitter) runs
+  # on CPU workers and is the wall-clock limiter once checkpointing is off --
+  # sized for the Pro 6000 workstation's core count. Lower if the box swaps.
+  num_workers: 16
+  # ON per the 2026-08-06 audit_data.py measurement: fake class is 45.3% PNG
+  # vs 17.3% for real, with a 6x bytes/pixel tail gap -- source-codec history
+  # is a label shortcut. The prechain launders it label-independently
+  # (30% none / 45% jpeg q55-98 / 25% webp) BEFORE the view's own q75 base
+  # encode. Single re-encode only -- no blur/resize -- so it does not re-enter
+  # the run_3 high-frequency-erasure failure; still, watch face-swap and
+  # fakeclue-fake-ffpp in the per-eval tables as the canary.
+  clean_view_recompress: true
+  # 2026-08-07 laundering deltas -- EXPECTED_OUTCOMES.md declares the expected
+  # movement, acceptance criteria and revert trigger for each, and
+  # verify_views.py checks the mechanics. All three are label-independent.
+  laundering:
+    # Shifted double-JPEG prechain arm: JPEG(q1) -> 1-7px crop -> JPEG(q2),
+    # the misaligned-DCT-lattice signature of re-shared content. Mass carved
+    # from the single-jpeg arm: none 0.30 / jpeg 0.35 / double 0.10 / webp
+    # 0.25 (webp is the remainder; train.py rejects arms that exceed 1.0).
+    prechain_jpeg_p: 0.35
+    double_jpeg_p: 0.10
+    # Fraction of rng-driven view_b rendered with webp_quality=None --
+    # gasbench's own JPEG-only chain. Eval paths (rng=None) always keep the
+    # WebP hop, so val_*:robust still measures the exact deployed chain.
+    robust_skip_webp_p: 0.15
+    # Never random-crop semisynthetic in the ladder arm: eval's crop is
+    # mask-aware and keeps the edit in frame; we have no masks, and a crop
+    # that excludes the edit is a real view trained with label fake. The
+    # measured 62.1% semisynthetic accuracy is the class this protects.
+    ladder_crop_guard: true
+  resample_jitter:
+    enabled: true
+    p: 0.4
+    factor_range: [0.60, 1.0]
+    # kernels: ["area_linear", "area_cubic", "cubic_linear"]  # gated
+    # experiment, OFF by default -- kernel diversity may blur the INTER_LINEAR
+    # aliasing signature that is learnable signal (run_3 family). Adopt only
+    # per the criteria in EXPECTED_OUTCOMES.md.
+  # deploy = the exact scored transform; robust = the exact aug_binary_* chain;
+  # ladder = the eval chain with augment levels 0-3 enabled. The local gasbench
+  # CLI scores at level 0 (= deploy); the cloud runner's level is not
+  # observable, and the production score provably blends an aug pass
+  # (aug_weight 0.2) -- so ladder gets real mass as a hedge. But view_b is
+  # ALWAYS the robustness chain (CE + KL on it every step), so view_a's mix
+  # understates total degraded exposure: at deploy=0.70 the per-sample CE mass
+  # is already ~35% clean / 65% degraded. Pushing view_a lower re-enters the
+  # measured run_3 failure (data.py ViewConfig notes: face-swap 0.138,
+  # fakeclue-fake-ffpp 0.000 IN-train -- heavy aug erases the high-frequency
+  # evidence that identifies face manipulations).
+  view_arms:
+    deploy: 0.70
+    ladder: 0.20
+    robust: 0.10
+  # Per-epoch degradation profiles (2026-08-17 experiment). ACTIVATED ONLY by
+  # use_degradation_schedule: true -- flip it together with the per-branch
+  # epochs: 10 overrides for the experiment arm; false = baseline/control
+  # (base laundering/jitter/arms every epoch, schedule validated but unused).
+  # Epoch e trains under profile e % len(schedule); run every branch for the
+  # full 10 so training ends on the deploy-faithful finale profile.
+  use_degradation_schedule: true
+  # Each entry may override keys
+  # inside laundering / resample_jitter / view_arms ONLY -- never the enable
+  # flags (stream-safety; train.py:build_view enforces). Design rules:
+  # deploy >= 0.65 every epoch (the run_3 guard: heavy aug erases the HF
+  # evidence that identifies face manipulations), JPEG quality floor >= 40,
+  # and the FINAL epoch returns to a deploy-faithful mix so late checkpoints
+  # (which selection prefers) match the scored distribution. Requires
+  # persistent_workers=False on the train loader (train.py) -- with
+  # persistent workers, per-epoch state never reaches the workers at all.
+  degradation_schedule:
+    # epoch 0 -- mild / near-deploy
+    - laundering: {prechain_jpeg_p: 0.35, prechain_jpeg_q: [70, 98],
+                   double_jpeg_p: 0.05, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.30, factor_range: [0.75, 1.0]}
+      view_arms: {deploy: 0.80, ladder: 0.10, robust: 0.10}
+    # epoch 1 -- JPEG-heavy
+    - laundering: {prechain_jpeg_p: 0.55, prechain_jpeg_q: [50, 85],
+                   double_jpeg_p: 0.10, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.40, factor_range: [0.60, 1.0]}
+      view_arms: {deploy: 0.70, ladder: 0.20, robust: 0.10}
+    # epoch 2 -- WebP-heavy (webp is the prechain remainder: 1 - .30 - .20 - .05)
+    - laundering: {prechain_jpeg_p: 0.20, prechain_jpeg_q: [60, 95],
+                   double_jpeg_p: 0.05, robust_skip_webp_p: 0.0}
+      resample_jitter: {p: 0.40, factor_range: [0.60, 1.0]}
+      view_arms: {deploy: 0.70, ladder: 0.15, robust: 0.15}
+    # epoch 3 -- double-JPEG heavy (re-shared-content signature)
+    - laundering: {prechain_jpeg_p: 0.30, prechain_jpeg_q: [45, 90],
+                   double_jpeg_p: 0.30, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.40, factor_range: [0.60, 1.0]}
+      view_arms: {deploy: 0.70, ladder: 0.20, robust: 0.10}
+    # epoch 4 -- resample-heavy
+    - laundering: {prechain_jpeg_p: 0.35, prechain_jpeg_q: [55, 95],
+                   double_jpeg_p: 0.10, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.70, factor_range: [0.45, 1.0]}
+      view_arms: {deploy: 0.65, ladder: 0.25, robust: 0.10}
+    # epoch 5 -- robust-chain-heavy
+    - laundering: {prechain_jpeg_p: 0.40, prechain_jpeg_q: [50, 90],
+                   double_jpeg_p: 0.10, robust_skip_webp_p: 0.05}
+      resample_jitter: {p: 0.40, factor_range: [0.60, 1.0]}
+      view_arms: {deploy: 0.65, ladder: 0.10, robust: 0.25}
+    # epoch 6 -- mixed-hard
+    - laundering: {prechain_jpeg_p: 0.45, prechain_jpeg_q: [40, 85],
+                   double_jpeg_p: 0.15, robust_skip_webp_p: 0.10}
+      resample_jitter: {p: 0.50, factor_range: [0.50, 1.0]}
+      view_arms: {deploy: 0.65, ladder: 0.20, robust: 0.15}
+    # epoch 7 -- mild again (consolidation)
+    - laundering: {prechain_jpeg_p: 0.35, prechain_jpeg_q: [70, 98],
+                   double_jpeg_p: 0.05, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.30, factor_range: [0.75, 1.0]}
+      view_arms: {deploy: 0.80, ladder: 0.10, robust: 0.10}
+    # epoch 8 -- WebP + resample
+    - laundering: {prechain_jpeg_p: 0.25, prechain_jpeg_q: [60, 95],
+                   double_jpeg_p: 0.05, robust_skip_webp_p: 0.0}
+      resample_jitter: {p: 0.60, factor_range: [0.50, 1.0]}
+      view_arms: {deploy: 0.70, ladder: 0.15, robust: 0.15}
+    # epoch 9 -- deploy-faithful finale (matches the scored distribution)
+    - laundering: {prechain_jpeg_p: 0.35, prechain_jpeg_q: [55, 98],
+                   double_jpeg_p: 0.10, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.40, factor_range: [0.60, 1.0]}
+      view_arms: {deploy: 0.80, ladder: 0.10, robust: 0.10}
+
+sampler:
+  max_replay: 25.0
+  # 25% of each batch drawn as matched real/fake pairs from mixed-label
+  # split_units (celeb-a-hq vs its GAN edits, the fakeclue suite, the -real/
+  # -fake name pairs) -- the hardest, most informative examples.
+  clique_pair_frac: 0.25
+  # Three-way mass: real / wholly-generated / edited-real-photo. The axis no
+  # earlier sampler balanced, and the measured 19-24pt accuracy gap between
+  # manipulation and synthesis fakes traces to it. 50/25/25 keeps P(fake)=0.5
+  # (the identity calibration rests on); applied INSIDE each (label, category)
+  # cell so P(fake|category)=0.5 survives.
+  # v23 registry (2026-08-25): the audited taxonomy shrank the semi pool to
+  # 5 datasets, ALL in `faces` -- and because the shares are cell-local, the
+  # realized semi mass self-moderated from 43.4% to ~19.4% of the fake half
+  # (~9.7% of total; q_faces ~ 0.39), peak replay ~3.4x against the 25 cap.
+  # Values deliberately KEPT: still a ~3x lift over the natural 6.5%, enough
+  # for the type head (prior-corrected at export), safe on replay. If the
+  # semi pool's category geometry changes again, re-check p_kind /
+  # peak-replay in the sampler log and verify.py's absolute guardrails.
+  kind_balance:
+    real: 0.50
+    synthetic: 0.25
+    semisynthetic: 0.25
+  # Gasstation's group share within its (fake, diverse, synthetic) cell,
+  # after gasbench's GASSTATION_WEIGHT_MULTIPLIER = 5.0 (eval samples
+  # gasstation 5x per dataset; the adversarial stream is the benchmark's
+  # highest-weight single source). Group-level, so P(fake)=0.5 is untouched.
+  #
+  # 2.5, not 5.0: the cache holds 1/4 of the original 8 gasstation weeks.
+  # Share scales as sqrt(n) * boost and per-image replay as boost / sqrt(n),
+  # so quartering n doubles replay at fixed boost -- halving the boost
+  # restores the per-image replay of the validated 8-week design instead of
+  # over-repeating a small pool. Restore 5.0 if the full 8 weeks return.
+  # Check the printed p_gasstation/replay numbers after a manifest rebuild.
+  gasstation_boost: 2.5
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+
+training:
+  epochs: 2
+  # Global fallback; every branch overrides batch_size/lr above (96 GB card).
+  # lr overrides follow sqrt scaling from the validated 1e-4 @ batch 32.
+  batch_size: 64
+  grad_accum_steps: 1
+  lr: 1.4e-4
+  weight_decay: 0.02
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  amp: bf16               # never fp16: DINOv3 register activations hit 154k
+  ema_decay: 0.9995
+  # In STEPS. 500 @ batch 64-96 is ~32-48k samples between evals -- a COARSE
+  # grid: a ~2k-step run gets only ~4 checkpoint evaluations, so the selected
+  # "best" can sit up to 250 steps from the true best. Chosen to cut eval
+  # overhead on the 96GB box; drop back toward 150 if selection looks like it
+  # is missing peaks (best.pt selection score much below nearby train evals).
+  # "epoch" = evaluate at every epoch boundary (one eval per degradation
+  # profile in the experiment run; baseline gets one per epoch + final).
+  # An integer means every N optimizer steps, as before.
+  eval_every: epoch
+  # Checkpoint-selection mix. The ship split folds ~170 of the 183 benchmark
+  # datasets into train, so the public score is mostly an IN-DISTRIBUTION
+  # measurement and val_id predicts it far better than val_xgen: at step 1000
+  # of the 2026-08-07 dinov3 run, val_id:deploy sn34 was 0.8561 against a
+  # 0.8644 gasbench full-suite score (0.008 apart), while val_xgen read 0.9172.
+  # val_xgen keeps a minority weight so a checkpoint that wins on public data
+  # purely by abandoning unseen generators cannot be selected.
+  # Train-everything 80/20 experiment: no dataset-level holdouts exist, so
+  # checkpoint selection runs purely on the 20% val_id carve (block-wise,
+  # per dataset). Restore {val_id: 0.7, val_xgen: 0.3} when a holdout panel
+  # returns (ship runs with overrides-ship.yaml).
+  selection:
+    val_id: 1.0
+
+loss:
+  # CE(view_a) + CE(view_b) + kl*symKL + brier(ramped). Deliberately four
+  # terms: the v5 teacher/MIL/supcon stack was never individually ablated and
+  # BMF's production branches carry none of it.
+  kl_consistency: 0.50
+  brier: 0.50
+  brier_ramp: [0.2, 0.6]  # ramps 0->1 over this progress window
+  label_smoothing: 0.02
+  # Factorized 3-class terms (see train.py): binary CE on the collapsed pair
+  # keeps 2-logit semantics; type_weight scales the syn-vs-semi conditional
+  # CE on fake rows (0 => binary-only training with a 3-wide head -- the
+  # Gate-A fallback). No smoothing on the conditional term: the prior-shift
+  # init + post-hoc (T2, b2) fit handle the operating point.
+  type_weight: 0.3
+  type_label_smoothing: 0.0

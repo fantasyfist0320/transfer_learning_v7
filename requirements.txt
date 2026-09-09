@@ -1,0 +1,25 @@
+torch>=2.4
+torchvision>=0.19
+transformers>=4.56   # dinov3_vit model type first shipped in 4.56.0
+peft>=0.11            # TRAINING ONLY -- peft is not on the inference import
+                      # allowlist, so export.py merges the adapters away.
+accelerate>=0.34
+timm>=1.0             # convnext + eva branches (model.py family "timm")
+safetensors>=0.4
+pandas>=2.0
+pyarrow>=15           # manifest.parquet
+numpy>=1.24
+pillow>=10
+opencv-python>=4.9    # gasbench.processing.transforms
+scipy>=1.11           # gasbench distortions + temperature fit
+scikit-learn>=1.4     # audit_shortcuts.py
+pyyaml>=6
+tqdm>=4.66
+huggingface_hub>=0.24 # gated DINOv3 weight pull (accept license + login first)
+datasets>=2.19        # optional HF-side dataset access
+onnxruntime-gpu>=1.18 # gasbench imports onnxruntime at module level
+
+# gasbench itself provides the eval transforms and the canonical scorer.
+# Install the local checkout so training augmentation tracks the version that
+# will actually score the submission:
+#     pip install -e ../../gasbench

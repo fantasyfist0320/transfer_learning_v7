@@ -1,0 +1,144 @@
+# Domain probe suite: type -> {probes (NEVER trained), train sets, status}.
+# Read by eval_probes.py; status/notes are human-maintained (eval_probes
+# prints a suggested status each run -- copy it back here once reviewed).
+#
+# Rules (enforced or warned by eval_probes.py at load):
+#   * probe names start `probe-`; they are NEVER listed in extra_datasets.
+#     build_manifest.py skips registry-unknown dirs, so the prefix IS the
+#     train/eval isolation mechanism.
+#   * a type's train sets must come from a DIFFERENT origin than its probe,
+#     or the probe measures memorisation instead of coverage (same-host
+#     source_url triggers a warning).
+#   * per B-Free (arXiv:2412.17671): prefer adding train reals TOGETHER WITH
+#     matched fakes (img2img/inpainting of the same images, generate_swaps.py
+#     pattern) registered as a pair_groups clique -- unpaired stylistic reals
+#     risk teaching "this style = real".
+#
+# Taxonomy provenance: types are derived from the v21 released former hidden
+# holdouts (dflip3k=stylized reals, google-streetview, palm images,
+# data-art-backup, cddb), the winner's weak axes (hidden reals 32-86%), and
+# registry gaps. Extend freely; a type without probes reports "untested".
+
+version: 1
+
+types:
+  # ------------------------------------------------------------------ REAL
+  stylized-real:
+    status: untested
+    notes: >
+      The dflip3k failure class: LAION-aesthetic / community-model-adjacent
+      stylized photography. Largest measured weakness (15% before the dct
+      branch). Train sources laion-aes65 / unsplash-lite / phone-photos-2024
+      staged by prepare_reals.py (disjoint repos from the probe).
+    probes:
+      - name: probe-aesthetic-reals
+        label: real
+        source_url: https://huggingface.co/datasets/recoilme/aesthetic_photos_xs
+        added: 2026-08-13
+        # ingest: python ingest_external.py --role probe
+        #   --name probe-aesthetic-reals --label real
+        #   --src hf:recoilme/aesthetic_photos_xs:train
+        #   --source-url https://huggingface.co/datasets/recoilme/aesthetic_photos_xs
+        #   --collected-before 2021-12
+    train:
+      - name: laion-aes65
+        source_url: https://huggingface.co/datasets/bhargavsdesai/laion_improved_aesthetics_6.5plus_with_images
+      - name: unsplash-lite
+        source_url: https://huggingface.co/datasets/1aurent/unsplash-lite
+      - name: phone-photos-2024
+        source_url: https://huggingface.co/datasets/EarthnDusk/Photography_2024
+
+  streetview:
+    status: untested
+    notes: >
+      google-streetview-images was a hidden holdout (released v21, now parked
+      in val_stress). Verification type for the probe loop: gasbench scores
+      the registry twin per-dataset, giving an external truth to compare
+      against.
+    probes: []          # ingest a pre-2022 street-level set (e.g. Mapillary)
+    train: []
+
+  body-closeup:
+    status: untested
+    notes: >
+      feyiamujohuman-palm-images was a hidden holdout (v21). Hands, palms,
+      skin, body-part macro shots -- nearly absent from the registry reals.
+    probes: []
+    train: []
+
+  art-objects:
+    status: untested
+    notes: >
+      data-art-backup was a hidden holdout (v21): photographs OF art/design
+      objects (not digital art). Museum/product-photography style.
+    probes: []
+    train: []
+
+  film-analog:
+    status: untested
+    notes: Grain, vintage color, scans of prints -- pre-digital look.
+    probes: []
+    train: []
+
+  screenshot-ui:
+    status: untested
+    notes: Screenshots, UI captures, web content saved as images.
+    probes: []
+    train: []
+
+  drone-aerial:
+    status: untested
+    notes: >
+      Hobbyist drone photography (registry aerial is satellite-heavy).
+    probes: []
+    train: []
+
+  night-macro:
+    status: untested
+    notes: Long-exposure night, astro, macro -- extreme-optics reals.
+    probes: []
+    train: []
+
+  surveillance:
+    status: untested
+    notes: >
+      CCTV/low-quality capture (registry has scface; probe a different
+      origin).
+    probes: []
+    train: []
+
+  reshared-meme:
+    status: untested
+    notes: >
+      Multiply re-compressed, cropped, re-shared content -- the double-JPEG
+      prechain arm's target distribution, probed with genuine wild data.
+    probes: []
+    train: []
+
+  # ------------------------------------------------------------------ FAKE
+  community-finetune:
+    status: untested
+    notes: >
+      CivitAI-style community checkpoints/LoRA galleries -- the generator
+      pool public benchmarks undersample (Community Forensics, arXiv:
+      2411.04125, is a candidate train source; keep the probe from a
+      different origin, e.g. self-generated with checkpoints not in the
+      train slice).
+    probes: []
+    train: []
+
+  frontier-commercial:
+    status: untested
+    notes: >
+      Newest commercial T2I outputs collected online (registry covers many
+      via gasstation; probe with generators the cache lacks).
+    probes: []
+    train: []
+
+  upscaler-enhanced:
+    status: untested
+    notes: >
+      Real photos passed through AI upscalers/enhancers -- semisynthetic
+      boundary cases; benchmark scores them fake.
+    probes: []
+    train: []

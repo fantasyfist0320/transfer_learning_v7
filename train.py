@@ -1,0 +1,705 @@
+"""v7 trainer: one branch per run.
+
+    accelerate launch train.py --config config.yaml --branch clip
+    accelerate launch train.py --config config.yaml --branch dinov3 --max-steps 60
+
+Branches never share a process. The fused model exists only at export time,
+which is what makes each branch's gasbench number attributable and lets a bad
+branch be dropped without retraining the rest.
+
+Loss = CE(view_a) + CE(view_b) + kl * symKL(a, b) + brier(ramped) -- four
+terms, all directly objective-aligned: view_a is the exact scored transform,
+view_b the exact aug_binary_* chain, KL ties them, and Brier is beta=1.8 of
+the deployed score. Selection = blended sn34 on val_xgen under a cross-fitted
+temperature (calibrate.py, carried over verified from the previous package).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import math
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import yaml
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from torch.utils.data import DataLoader
+
+from branches import BRANCHES, resolve
+from build_splits import _stable_frac
+from calibrate import (blended_sn34, class_balance_weights,
+                       crossfit_temperature, fit_temperature, sn34_from_probs)
+from data import (BalancedSampler, ManifestDataset, ViewConfig,
+                  balanced_weights, clique_pairs, worker_init_fn)
+from model import BranchModel, binary_margin, collapse_binary, type_margin
+
+REQUIRED = {
+    "data": ["manifest", "image_size", "num_workers", "view_arms"],
+    "sampler": ["max_replay", "clique_pair_frac", "kind_balance"],
+    "training": ["epochs", "batch_size", "grad_accum_steps", "lr",
+                 "weight_decay", "warmup_ratio", "max_grad_norm", "amp",
+                 "ema_decay", "eval_every"],
+    "loss": ["kl_consistency", "brier", "brier_ramp", "label_smoothing",
+             "type_weight", "type_label_smoothing"],
+    "lora": ["r", "alpha", "dropout"],
+}
+OPTIONAL_DATA = ("clean_view_recompress", "resample_jitter", "laundering",
+                 "selection", "gasstation_boost", "degradation_schedule",
+                 "use_degradation_schedule", "view_b", "eval_max_rows",
+                 "ladder_level_probs")
+
+
+def validate_config(cfg: dict) -> None:
+    missing = [f"{s}.{k}" for s, ks in REQUIRED.items()
+               for k in ks if k not in (cfg.get(s) or {})]
+    unknown = [f"{s}.{k}" for s, d in cfg.items()
+               if isinstance(d, dict) and s in REQUIRED
+               for k in d if k not in REQUIRED[s] and k not in OPTIONAL_DATA]
+    problems = []
+    if missing:
+        problems.append("missing keys:\n    " + "\n    ".join(missing))
+    if unknown:
+        problems.append("keys nothing reads:\n    " + "\n    ".join(unknown))
+    for k in ("seed", "output_dir", "branches"):
+        if k not in cfg:
+            problems.append(f"missing top-level {k!r}")
+    if problems:
+        raise SystemExit("config.yaml does not match train.py\n\n"
+                         + "\n\n".join(problems))
+    arms = cfg["data"]["view_arms"]
+    tot = sum(float(arms[a]) for a in ("deploy", "ladder", "robust"))
+    if abs(tot - 1.0) > 1e-6:
+        raise SystemExit(f"view_arms must sum to 1.0, got {tot}")
+
+
+def build_view(d: dict, overrides: dict | None = None,
+               tag: str = "data") -> ViewConfig:
+    """Construct a training ViewConfig from cfg["data"], optionally layered
+    with one epoch's degradation-schedule overrides.
+
+    Schedule entries may override `laundering`, `resample_jitter` and
+    `view_arms` KEYS ONLY -- never the `clean_view_recompress` /
+    `resample_jitter.enabled` flags: toggling an enable flag changes how many
+    draws __getitem__ consumes from the shared per-row RNG stream
+    (data.py:654-676), silently shifting every downstream decision (flips,
+    arm selection, robustness params) between epochs. Probabilities and
+    ranges are stream-safe; flags are not.
+
+    Every epoch's merged config is re-validated here (arms sum to 1.0; the
+    prechain arms leave room for the webp remainder), because the startup
+    validate_config() only sees the base config.
+    """
+    arms = dict(d["view_arms"])
+    rj = dict(d.get("resample_jitter") or {})
+    la = dict(d.get("laundering") or {})
+    ov = overrides or {}
+    unknown = set(ov) - {"laundering", "resample_jitter", "view_arms"}
+    if unknown:
+        raise SystemExit(f"{tag}: unknown override sections {sorted(unknown)}")
+    if "enabled" in (ov.get("resample_jitter") or {}):
+        raise SystemExit(f"{tag}: toggling resample_jitter.enabled per epoch "
+                         f"shifts the shared RNG stream; vary p/factor_range "
+                         f"instead")
+    arms.update(ov.get("view_arms") or {})
+    rj.update(ov.get("resample_jitter") or {})
+    la.update(ov.get("laundering") or {})
+
+    tot = arms["deploy"] + arms["ladder"] + arms["robust"]
+    if abs(tot - 1.0) > 1e-6:
+        raise SystemExit(f"{tag}: view_arms must sum to 1.0, got {tot:.4f}")
+    # The webp arm is the remainder in _prechain_arm, so the named arms must
+    # leave room for it: double mass is carved from the jpeg arm, not added.
+    named = 0.30 + la.get("prechain_jpeg_p", 0.45) + la.get("double_jpeg_p", 0.0)
+    if named > 1.0 + 1e-9:
+        raise SystemExit(f"{tag}: prechain arms exceed 1.0 ({named:.2f}); "
+                         f"lower prechain_jpeg_p when raising double_jpeg_p")
+    # Ladder level mixture (L0..L3). A `data.` key, NOT a laundering one, so
+    # the degradation schedule cannot vary it -- deliberate: it changes which
+    # augmentation FAMILIES exist, not how strong they are, and a per-epoch
+    # swap of that is the kind of non-stationarity the schedule is barred from
+    # (build_view rejects enable-flag overrides for the same reason).
+    lp = d.get("ladder_level_probs")
+    if lp is not None:
+        lp = tuple(float(x) for x in lp)
+        if len(lp) != 4 or any(x < 0 for x in lp):
+            raise SystemExit(f"{tag}: ladder_level_probs must be 4 "
+                             f"non-negative numbers (L0..L3), got {lp}")
+        if abs(sum(lp) - 1.0) > 1e-6:
+            # apply_random_augmentations raises on this too, but inside a
+            # dataloader worker mid-run; fail here instead.
+            raise SystemExit(f"{tag}: ladder_level_probs must sum to 1.0, "
+                             f"got {sum(lp):.4f}")
+    view_b = d.get("view_b", "robust")
+    if view_b not in ("robust", "deploy"):
+        # Loud, because the failure mode of a typo here is an arm that LOOKS
+        # like the no-degradation treatment but still trains a robust view_b.
+        raise SystemExit(f"{tag}: data.view_b must be 'robust' or 'deploy', "
+                         f"got {view_b!r}")
+    return ViewConfig(image_size=d["image_size"],
+                      view_b_mode=view_b,
+                      prechain=d.get("clean_view_recompress", False),
+                      prechain_jpeg_p=la.get("prechain_jpeg_p", 0.45),
+                      prechain_jpeg_q=tuple(la.get("prechain_jpeg_q",
+                                                   (55, 98))),
+                      prechain_webp_q=tuple(la.get("prechain_webp_q",
+                                                   (60, 95))),
+                      prechain_double_p=la.get("double_jpeg_p", 0.0),
+                      resample_jitter=rj.get("enabled", False),
+                      resample_jitter_p=rj.get("p", 0.4),
+                      resample_jitter_range=tuple(rj.get("factor_range",
+                                                         (0.60, 1.0))),
+                      resample_jitter_kernels=tuple(rj.get("kernels",
+                                                           ("area_linear",))),
+                      robust_skip_webp_p=la.get("robust_skip_webp_p", 0.0),
+                      ladder_crop_guard=la.get("ladder_crop_guard", True),
+                      ladder_level_probs=lp,
+                      arm_deploy=arms["deploy"], arm_ladder=arms["ladder"],
+                      arm_robust=arms["robust"])
+
+
+def cosine_lr(step: int, total: int, warmup: int) -> float:
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    t = (step - warmup) / max(1, total - warmup)
+    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+
+
+class EMA:
+    def __init__(self, model, decay: float):
+        self.decay = decay
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.shadow = [p.detach().float().clone() for p in self.params]
+
+    @torch.no_grad()
+    def update(self, step: int) -> None:
+        d = min(self.decay, (1.0 + step) / (10.0 + step))
+        torch._foreach_mul_(self.shadow, d)
+        torch._foreach_add_(self.shadow,
+                            [p.detach().float() for p in self.params],
+                            alpha=1.0 - d)
+
+    @contextlib.contextmanager
+    def swapped_in(self):
+        backup = [p.detach().clone() for p in self.params]
+        with torch.no_grad():
+            for p, s in zip(self.params, self.shadow):
+                p.copy_(s.to(p.dtype))
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for p, b in zip(self.params, backup):
+                    p.copy_(b)
+
+
+def symmetric_kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    la, lb = F.log_softmax(a, -1), F.log_softmax(b, -1)
+    return 0.5 * (F.kl_div(la, lb.exp(), reduction="batchmean")
+                  + F.kl_div(lb, la.exp(), reduction="batchmean"))
+
+
+def brier_loss(z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # p_notreal = 1 - softmax[0]: K-generic, matches the deployed binary
+    # collapse (gasbench scores binary MCC/Brier on exactly this quantity).
+    p = 1.0 - F.softmax(z, -1)[:, 0]
+    return ((p - y.float()) ** 2).mean()
+
+
+@torch.no_grad()
+def collect_margins(model, loader, acc) -> dict:
+    was = model.training
+    model.eval()
+    ds, d2s, ys, y3s, rid = [], [], [], [], []
+    for batch in loader:
+        z = model(batch["x"].to(acc.device, non_blocking=True))
+        d = binary_margin(z).float()
+        d2 = type_margin(z).float()
+        ds.append(acc.gather_for_metrics(d).cpu())
+        d2s.append(acc.gather_for_metrics(d2).cpu())
+        ys.append(acc.gather_for_metrics(batch["y"].to(acc.device)).cpu())
+        y3s.append(acc.gather_for_metrics(batch["y3"].to(acc.device)).cpu())
+        rid.append(acc.gather_for_metrics(
+            batch["row_id"].to(acc.device)).cpu())
+    model.train(was)
+    return {"d": torch.cat(ds).numpy(), "d2": torch.cat(d2s).numpy(),
+            "y": torch.cat(ys).numpy(), "y3": torch.cat(y3s).numpy(),
+            "row_id": torch.cat(rid).numpy()}
+
+
+def cap_eval_frame(sub: pd.DataFrame, cap: int, seed: int) -> pd.DataFrame:
+    """Down-sample ONE eval split to ~`cap` rows, stratified on dataset.
+
+    Dense evals (eval_every: 500) over the full val splits cost more wall
+    clock than the training between them once the corpus grows past ~100k
+    rows. This trades eval precision for eval FREQUENCY: a fixed
+    representative subsample measured often beats the whole split measured
+    two or three times.
+
+    Three properties the caller depends on:
+
+      * DETERMINISTIC, and stable as the manifest grows. Rows are ranked by
+        blake2b(image_id | seed) -- the same hash build_splits.py ranks
+        blocks with -- not by an RNG draw, so the same rows survive on every
+        eval, across restarts, AND across a corpus rebuild: a row's rank
+        depends only on its own id, so growing the manifest shrinks the
+        subsample without RESAMPLING it. That is what makes two runs (or two
+        rungs of a budget ladder) a PAIRED comparison, which is the only
+        reason a ~0.002 sn34 difference is readable at n=8000. `df.sample()`
+        has none of this. `seed` is cfg["seed"], the global eval yardstick.
+      * EVERY (dataset, label) cell survives: the quota is floored at 1.
+        val_xgen's selection score is cross-fitted by folding on `dataset`
+        and falls back to a pooled temperature below min_groups=4
+        (calibrate.crossfit_temperature), so silently dropping small
+        datasets would change WHICH estimator picks best.pt. The floor makes
+        `cap` a target, not a hard ceiling.
+      * Row ORDER is preserved (boolean mask, no reorder). The deploy and
+        robust loaders are built from this one frame and evaluate_and_report
+        pairs their margins elementwise -- see the call site.
+
+    Label balance comes free: build_manifest.py writes `label` and `kind`
+    from the per-dataset registry entry, so both are constant within a
+    dataset and preserving dataset proportions preserves them exactly.
+    `label` is in the strata as insurance against a future mixed-label
+    dataset, not as a no-op today.
+    """
+    if cap <= 0 or len(sub) <= cap:
+        return sub                  # absent key / already small: untouched
+    # .astype(str) is load-bearing: groupby drops NaN keys, which would leave
+    # those rows with a NaN quota and make the comparison below raise.
+    cell = [sub["dataset"].astype(str), sub["label"]]
+    g = sub["image_id"].astype(str).map(
+        lambda k: _stable_frac(f"evalcap|{k}", seed)).groupby(cell)
+    quota = (g.transform("size") * (cap / len(sub))).round().clip(lower=1)
+    return sub[g.rank(method="first") <= quota].reset_index(drop=True)
+
+
+def build_eval_loader(df, view, mode, bs, workers, seed):
+    ds = ManifestDataset(df, view, train=False, eval_mode=mode, seed=seed)
+    # persistent_workers=False on purpose: 6 eval loaders x 8 workers would
+    # otherwise hold 48 resident processes between evals for splits a few
+    # thousand rows each; respawn cost per eval is seconds.
+    return DataLoader(ds, batch_size=bs, shuffle=False, num_workers=workers,
+                      pin_memory=True, persistent_workers=False,
+                      worker_init_fn=worker_init_fn)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--branch", required=True,
+                    help=f"one of {sorted(BRANCHES)}")
+    ap.add_argument("--max-steps", type=int, default=None)
+    args = ap.parse_args()
+    cfg = yaml.safe_load(Path(args.config).read_text())
+    validate_config(cfg)
+    spec = resolve([args.branch])[0]
+    bcfg = (cfg.get("branches") or {}).get(args.branch) or {}
+
+    set_seed(cfg["seed"])
+    out = Path(cfg["output_dir"]) / args.branch
+    out.mkdir(parents=True, exist_ok=True)
+    tr, lo = dict(cfg["training"]), cfg["loss"]
+    # Branch entries may override the memory/optimisation knobs: the branches
+    # span 11M-full-trainable to ViT-L@448, so one global batch size either
+    # starves the small ones or OOMs the big ones. Everything else stays
+    # global so runs remain comparable.
+    for k in ("batch_size", "grad_accum_steps", "lr", "epochs"):
+        if k in bcfg:
+            tr[k] = bcfg[k]
+    acc = Accelerator(gradient_accumulation_steps=tr["grad_accum_steps"],
+                      mixed_precision=tr["amp"])
+
+    df = pd.read_parquet(cfg["data"]["manifest"])
+    if "split" not in df.columns or (df["split"] == "").all():
+        raise SystemExit("manifest has no splits; run build_splits.py --write")
+    if "kind" not in df.columns:
+        raise SystemExit("manifest has no `kind` column; rebuild with "
+                         "build_manifest.py (resolve_kind writes it)")
+
+    d = cfg["data"]
+    view = build_view(d)                     # base config: eval loaders + epoch default
+    # Fail fast on EVERY epoch's degradation overrides, not just epoch 0's --
+    # validated even when the schedule is disabled, so config errors surface
+    # before the experiment run rather than during it.
+    for i, ov in enumerate(d.get("degradation_schedule") or []):
+        build_view(d, ov, tag=f"degradation_schedule[{i}]")
+    # The schedule only ACTIVATES via the explicit flag: the baseline run must
+    # train under the unmodified base config (control arm of the experiment).
+    sched = (d.get("degradation_schedule") or []) \
+        if d.get("use_degradation_schedule", False) else []
+    if sched and acc.is_main_process:
+        print(f"[{spec.name}] degradation schedule ACTIVE: {len(sched)} epoch "
+              f"profiles (epoch e uses profile e % {len(sched)})")
+    if acc.is_main_process:
+        # Always printed: the no-degradation arm is only real if this says
+        # "deploy" -- a silently-defaulted robust view_b would fake the arm.
+        print(f"[{spec.name}] view_b (consistency view): {view.view_b_mode}"
+              + (" -- clean duplicate of the deploy render; no degraded "
+                 "pixels enter the loss"
+                 if view.view_b_mode == "deploy" else ""), flush=True)
+
+    tr_df = df[df.split == "train"].reset_index(drop=True)
+    w, rep = balanced_weights(tr_df, amp_max=cfg["sampler"]["max_replay"],
+                              kind_balance=cfg["sampler"]["kind_balance"],
+                              gasstation_boost=float(
+                                  cfg["sampler"].get("gasstation_boost", 1.0)),
+                              verbose=acc.is_main_process)
+    pairs = clique_pairs(tr_df)
+    sampler = BalancedSampler(w, num_samples=len(tr_df), seed=cfg["seed"],
+                              rank=acc.process_index,
+                              world_size=acc.num_processes, pairs=pairs,
+                              pair_frac=cfg["sampler"]["clique_pair_frac"])
+    train_ds = ManifestDataset(tr_df, view, train=True, seed=cfg["seed"])
+    train_loader = DataLoader(
+        train_ds, batch_size=tr["batch_size"], sampler=sampler,
+        num_workers=d["num_workers"], pin_memory=True, drop_last=True,
+        # persistent_workers MUST stay False: workers fork the dataset ONCE,
+        # so with persistent workers set_epoch() never reaches them -- epoch 2
+        # would render byte-identical augmentations to epoch 1 (verified
+        # against torch 2.7: _MultiProcessingDataLoaderIter._reset only
+        # rebuilds the sampler iter). Respawn cost is seconds per epoch.
+        persistent_workers=False,
+        worker_init_fn=worker_init_fn)
+
+    evals = {}
+    # `data.eval_max_rows` fixes a stratified subsample of each val split
+    # ONCE, here; every eval from then on reads exactly those rows, so a
+    # moving val curve is the model moving and not the yardstick. Absent (or
+    # a split already under the cap) => the full split, byte-identical to
+    # the uncapped pipeline.
+    cap = int(d.get("eval_max_rows") or 0)
+    for split in ("val_id", "val_xgen", "val_stress"):
+        full = df[df.split == split].reset_index(drop=True)
+        if len(full):
+            sub = cap_eval_frame(full, cap, cfg["seed"])
+            if len(sub) != len(full) and acc.is_main_process:
+                print(f"[{spec.name}] eval_max_rows={cap}: {split} "
+                      f"{len(full):,} -> {len(sub):,} rows, datasets "
+                      f"{full['dataset'].nunique()} -> "
+                      f"{sub['dataset'].nunique()}, p_fake "
+                      f"{full['label'].mean():.4f} -> "
+                      f"{sub['label'].mean():.4f}", flush=True)
+            # ONE frame for BOTH modes, deliberately. evaluate_and_report
+            # indexes the stored frame positionally by row_id, and pairs the
+            # robust margins elementwise against the DEPLOY labels with no
+            # realignment -- deploy[i] and robust[i] must be the same image.
+            # Sharing the object is what guarantees that.
+            for mode in ("deploy", "robust"):
+                evals[f"{split}:{mode}"] = (sub, build_eval_loader(
+                    sub, view, mode, tr["batch_size"], d["num_workers"],
+                    cfg["seed"]))
+
+    model = BranchModel(
+        spec, lora_r=cfg["lora"]["r"], lora_alpha=cfg["lora"]["alpha"],
+        lora_dropout=cfg["lora"]["dropout"],
+        gradient_checkpointing=bcfg.get("gradient_checkpointing", True))
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if acc.is_main_process:
+        print(f"[{spec.name}] {spec.model_id}  head={spec.head}  "
+              f"native={spec.native_size}  trainable={n_train/1e6:.1f}M")
+
+    opt = torch.optim.AdamW(model.param_groups(tr["lr"]),
+                            weight_decay=tr["weight_decay"])
+    model, opt, train_loader = acc.prepare(model, opt, train_loader)
+
+    steps_per_epoch = len(train_loader)
+    total = args.max_steps or steps_per_epoch * tr["epochs"]
+    warmup = int(total * tr["warmup_ratio"])
+    # Eval cadence: an integer = every N steps; the string "epoch" = at each
+    # epoch boundary -- with a degradation schedule this aligns every
+    # measurement with exactly one epoch profile (the val_stress dflip rows
+    # become a per-profile learning curve).
+    eval_interval = (steps_per_epoch if str(tr["eval_every"]) == "epoch"
+                     else int(tr["eval_every"]))
+    if eval_interval <= 0:
+        raise SystemExit(f"eval_every resolves to {eval_interval}; use a "
+                         f"positive integer or 'epoch'")
+    ema = EMA(acc.unwrap_model(model), tr["ema_decay"])
+
+    best_sel, step = -1.0, 0
+    lora_recheck: set[str] = set()
+    t0 = time.time()
+    for epoch in range(tr["epochs"]):
+        sampler.set_epoch(epoch)
+        # With a degradation schedule, each epoch trains under its own
+        # laundering/jitter/arm profile (a NEW ViewConfig -- the eval loaders
+        # keep the untouched base `view` instance).
+        epoch_view = (build_view(d, sched[epoch % len(sched)],
+                                 tag=f"epoch {epoch}") if sched else None)
+        train_ds.set_epoch(epoch, epoch_view)
+        if sched and acc.is_main_process:
+            ev = epoch_view
+            print(f"[{spec.name}] epoch {epoch} degradation profile "
+                  f"{epoch % len(sched)}: jpeg_p={ev.prechain_jpeg_p} "
+                  f"q={ev.prechain_jpeg_q} double_p={ev.prechain_double_p} "
+                  f"jitter_p={ev.resample_jitter_p} rng={ev.resample_jitter_range} "
+                  f"arms=({ev.arm_deploy},{ev.arm_ladder},{ev.arm_robust})",
+                  flush=True)
+        run_acc, run_n = 0.0, 0
+        for batch in train_loader:
+            if step >= total:
+                break
+            progress = step / max(1, total)
+            with acc.accumulate(model):
+                xa = batch["x_a"].to(acc.device, non_blocking=True)
+                xb = batch["x_b"].to(acc.device, non_blocking=True)
+                y = batch["y"].to(acc.device)
+                y3 = batch["y3"].to(acc.device)
+                za, zb = model(xa), model(xb)
+                ls = lo["label_smoothing"]
+                # Factorized 3-class CE: CE_3(y3) == CE_bin(collapse, y)
+                # + CE_cond(fake rows). Keeping the terms separate keeps the
+                # binary term byte-identical to the 2-logit pipeline (incl.
+                # 2-class label smoothing -- plain 3-class smoothing would
+                # leak ls/3 onto the semi logit and drag q toward 0.5) and
+                # makes type_weight the single risk dial (0 => binary-only
+                # training with a 3-wide head).
+                # kl held in a name so the periodic print can report its raw
+                # magnitude: with a deploy view_b the pair is byte-identical
+                # and this term becomes dropout-consistency (R-Drop) -- the
+                # experiment writeup needs its size, not an assumption of 0.
+                kl = symmetric_kl(za, zb)
+                loss = (F.cross_entropy(collapse_binary(za), y, label_smoothing=ls)
+                        + F.cross_entropy(collapse_binary(zb), y, label_smoothing=ls)
+                        + lo["kl_consistency"] * kl)
+                lam = lo["type_weight"]
+                fake = y3 > 0
+                if lam > 0 and bool(fake.any()):
+                    ls_t = lo["type_label_smoothing"]
+                    loss = loss + lam * 0.5 * (
+                        F.cross_entropy(za[fake][:, 1:], y3[fake] - 1,
+                                        label_smoothing=ls_t)
+                        + F.cross_entropy(zb[fake][:, 1:], y3[fake] - 1,
+                                          label_smoothing=ls_t))
+                r0, r1 = lo["brier_ramp"]
+                ramp = min(1.0, max(0.0, (progress - r0) / max(1e-9, r1 - r0)))
+                loss = loss + lo["brier"] * ramp * 0.5 * (
+                    brier_loss(za, y) + brier_loss(zb, y))
+                acc.backward(loss)
+                if step == 0:
+                    # Gradient checkpointing silently drops gradients when the
+                    # input to a checkpointed block does not require grad --
+                    # which is the normal state here, since every backbone is
+                    # frozen except LoRA/norms. The HF path is handled in
+                    # model.py (use_reentrant=False + enable_input_require_grads);
+                    # timm's set_grad_checkpointing has no such switch, so the
+                    # convnext/eva branches are checked empirically instead of
+                    # trusted. A branch that trains with dead gradients looks
+                    # perfectly healthy in the loss curve and wastes the run.
+                    #
+                    # Dropped-by-checkpointing means grad is None. A grad that
+                    # EXISTS but is all-zero is a different animal: LoRALinear
+                    # zero-inits B, so dL/dA = scaling * B^T d L/dh x^T is
+                    # exactly zero on the first step for every LoRA A weight,
+                    # by construction and only on the first step. Those are
+                    # deferred and re-checked after the first optimizer update
+                    # (B != 0 by then, so a still-zero A is genuinely dead).
+                    unwrapped = acc.unwrap_model(model)
+                    live, dead, deferred = [], [], []
+                    for n, p in unwrapped.named_parameters():
+                        if not p.requires_grad:
+                            continue
+                        if (p.grad is not None and torch.isfinite(p.grad).any()
+                                and p.grad.abs().sum() > 0):
+                            live.append(n)
+                        elif p.grad is not None and n.endswith(".A.weight"):
+                            deferred.append(n)
+                        else:
+                            dead.append(n)
+                    if acc.is_main_process:
+                        print(f"[{spec.name}] grad check: {len(live)} params "
+                              f"receiving gradient, {len(dead)} dead, "
+                              f"{len(deferred)} LoRA A zero-by-init "
+                              f"(re-checked after first update)", flush=True)
+                    if dead:
+                        raise SystemExit(
+                            f"{len(dead)} trainable parameters received no "
+                            f"gradient on the first step, e.g. {dead[:6]}. "
+                            f"Most likely gradient checkpointing is dropping "
+                            f"them: set branches.{spec.name}."
+                            f"gradient_checkpointing: false in config.yaml "
+                            f"(lower batch_size if VRAM is tight) and re-run.")
+                    lora_recheck = set(deferred)
+                if lora_recheck and step == tr["grad_accum_steps"]:
+                    # First step after a completed optimizer update: B has
+                    # moved off zero, so the step-0 excuse no longer applies.
+                    unwrapped = acc.unwrap_model(model)
+                    still = [n for n, p in unwrapped.named_parameters()
+                             if n in lora_recheck
+                             and (p.grad is None or p.grad.abs().sum() == 0)]
+                    if still:
+                        raise SystemExit(
+                            f"{len(still)} LoRA A weights still receive no "
+                            f"gradient after the first optimizer update, e.g. "
+                            f"{still[:6]}. These are genuinely disconnected -- "
+                            f"check gradient checkpointing for "
+                            f"branches.{spec.name}.")
+                    if acc.is_main_process:
+                        print(f"[{spec.name}] grad check: all "
+                              f"{len(lora_recheck)} deferred LoRA A weights "
+                              f"receive gradient after first update", flush=True)
+                    lora_recheck = set()
+                if acc.sync_gradients:
+                    acc.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        tr["max_grad_norm"])
+                lr = tr["lr"] * cosine_lr(step, total, warmup)
+                for g in opt.param_groups:
+                    g["lr"] = lr
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            if acc.sync_gradients:
+                ema.update(step)
+            # Binary accuracy via the collapse margin, not argmax over 3:
+            # the running print stays comparable with 2-logit history and
+            # is not distorted by how the fake mass splits across classes.
+            run_acc += ((binary_margin(za) > 0).long() == y).float().sum().item()
+            run_n += len(y)
+            step += 1
+
+            if step % 50 == 0 and acc.is_main_process:
+                print(f"[{spec.name}] ep{epoch} step {step}/{total} "
+                      f"loss={loss.item():.4f} kl={kl.item():.4f} "
+                      f"acc={run_acc/max(1,run_n):.4f} "
+                      f"lr={lr:.2e} {(time.time()-t0)/step:.2f}s/step",
+                      flush=True)
+                run_acc, run_n = 0.0, 0
+
+            if step % eval_interval == 0 or step == total:
+                with ema.swapped_in():
+                    res = {k: collect_margins(model, ld, acc)
+                           for k, (sub, ld) in evals.items()}
+                if acc.is_main_process:
+                    sel = evaluate_and_report(res, evals, spec.name, step,
+                                              tr.get("selection"))
+                    if sel > best_sel:
+                        best_sel = sel
+                        m = acc.unwrap_model(model)
+                        with ema.swapped_in():
+                            torch.save(
+                                {"branch": spec.name, "step": step,
+                                 "state": m.state_dict(),
+                                 "selection": sel, "config": cfg,
+                                 # cfg records the raw file; per-branch
+                                 # overrides (epochs/batch/lr) live in tr.
+                                 # spec records native_size etc.: no tensor
+                                 # shape depends on it, so a mismatched
+                                 # strict load would otherwise be silent --
+                                 # export.py cross-checks it vs the registry.
+                                 "spec": asdict(spec),
+                                 "training_effective": dict(tr)},
+                                out / "best.pt")
+                        print(f"[{spec.name}] saved best.pt (sel={sel:.4f})",
+                              flush=True)
+                acc.wait_for_everyone()
+        if step >= total:
+            break
+    if acc.is_main_process:
+        print(f"[{spec.name}] done. best selection {best_sel:.4f} "
+              f"-> {out/'best.pt'}")
+
+
+def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
+                        weights: dict | None = None) -> float:
+    """Blended sn34 per split; selection is a weighted mix of split scores."""
+    print(f"  [eval] step {step}")
+    print(f"    {'split':22s}{'n':>8}{'acc':>8}{'sn34':>8}{'type':>8}")
+    for key, r in res.items():
+        acc_v = float(((r["d"] > 0).astype(int) == r["y"]).mean())
+        # Diagnostic only, never selection: syn-vs-semi accuracy of the raw
+        # type margin on fake rows (needs both fake kinds in the split).
+        tstr = "--"
+        if "y3" in r:
+            fk = r["y3"] > 0
+            if fk.any() and len(set(r["y3"][fk].tolist())) == 2:
+                tacc = float(((r["d2"][fk] > 0).astype(int)
+                              == (r["y3"][fk] == 2).astype(int)).mean())
+                tstr = f"{tacc:.4f}"
+        if len(set(r["y"].tolist())) < 2:
+            # Single-label canary split (val_stress is real-only): MCC/sn34
+            # are undefined and a temperature fit is degenerate -- accuracy
+            # here is the false-positive rate complement, which is the point.
+            print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{'--':>8}{tstr:>8}")
+            continue
+        wts = class_balance_weights(r["y"])
+        cal = fit_temperature(r["y"], r["d"])
+        m = sn34_from_probs(r["y"],
+                            1 / (1 + np.exp(-r["d"] / cal["temperature"])),
+                            wts)
+        print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{m['sn34']:>8.4f}{tstr:>8}")
+    # -- selection -----------------------------------------------------------
+    # Which split should choose the checkpoint depends on what the model is
+    # being built for, and the two goals disagree:
+    #
+    #   val_xgen  measures generalisation to UNSEEN generators -- the right
+    #             signal when holdouts are the target (hidden-holdout score).
+    #   val_id    measures unseen IMAGES from SEEN datasets -- which is exactly
+    #             what the public benchmark does, now that the ship split folds
+    #             ~170 of 183 benchmark datasets into train.
+    #
+    # Measured on the 2026-08-07 dinov3 run at step 1000: val_id:deploy sn34
+    # 0.8561 vs gasbench full-suite 0.8644 (0.008 apart), while val_xgen:deploy
+    # read 0.9172 -- a 0.05 overestimate. val_id is the honest predictor of the
+    # public number; val_xgen peaked at step 1000 and fell while val_id kept
+    # climbing, so selecting on val_xgen freezes best.pt long before the public
+    # score stops improving.
+    #
+    # Default keeps historical behaviour (pure val_xgen). Set
+    # training.selection: {val_id: 0.7, val_xgen: 0.3} for a ship run.
+    sel_w = dict(weights or {"val_xgen": 1.0})
+    parts: dict[str, float] = {}
+
+    if "val_id:deploy" in res and sel_w.get("val_id", 0.0) > 0:
+        r = res["val_id:deploy"]
+        ra = res.get("val_id:robust")
+        w_id = class_balance_weights(r["y"])
+        cal = fit_temperature(r["y"], r["d"],
+                              ra["d"] if ra is not None else None)
+        T = cal["temperature"]
+        base = sn34_from_probs(r["y"], 1 / (1 + np.exp(-r["d"] / T)), w_id)
+        if ra is not None:
+            aug = sn34_from_probs(r["y"], 1 / (1 + np.exp(-ra["d"] / T)), w_id)
+            parts["val_id"] = 0.8 * base["sn34"] + 0.2 * aug["sn34"]
+        else:
+            parts["val_id"] = base["sn34"]
+
+    if "val_xgen:deploy" in res:
+        sub = evals["val_xgen:deploy"][0]
+        r = res["val_xgen:deploy"]
+        # margins are gathered in loader order; row_id maps them back onto the
+        # split frame so each sample carries its dataset for fold assignment
+        # (deploy and robust loaders share the same order). Fold on `dataset`,
+        # not `generator_family`: every real dataset carries the family "real",
+        # which would collapse the whole real class into one fold unit and
+        # leave the other fold single-label (pooled-T fallback, silently).
+        fam = sub["dataset"].astype(str).to_numpy()[r["row_id"]]
+        ra = res.get("val_xgen:robust")
+        xf = crossfit_temperature(r["y"], r["d"],
+                                  ra["d"] if ra is not None else None, fam)
+        parts["val_xgen"] = float(xf["blended_crossfit"])
+        tag = "" if xf.get("crossfit", True) else \
+            f"  [FALLBACK pooled T, {xf['n_groups']} groups]"
+        print(f"    val_xgen blend (cross-fit) = "
+              f"{parts['val_xgen']:.4f}{tag}")
+
+    used = {k: v for k, v in sel_w.items() if k in parts and v > 0}
+    tot = sum(used.values())
+    if not tot:
+        return 0.0
+    sel = sum(parts[k] * w for k, w in used.items()) / tot
+    if len(used) > 1:
+        detail = "  ".join(f"{k}={parts[k]:.4f}x{used[k]:g}" for k in used)
+        print(f"    selection = {sel:.4f}   ({detail})")
+    else:
+        print(f"    selection = {sel:.4f}")
+    return float(sel)
+
+
+if __name__ == "__main__":
+    main()

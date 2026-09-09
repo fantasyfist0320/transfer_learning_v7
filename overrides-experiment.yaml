@@ -1,0 +1,239 @@
+# ==========================================================================
+# EXPERIMENT-ONLY SPLIT CONFIG (train-everything 80/20, 2026-08-17).
+# Derived from overrides-ship.yaml: BOTH train_gates flipped to
+# include_in_train: true and ALL holdouts emptied. Use with:
+#   build_splits.py --overrides overrides-experiment.yaml --val-id-frac 0.20 --write
+# Ship submissions keep using overrides-ship.yaml. Regenerate this file if
+# the shared sections (pair_groups etc.) of the ship file change.
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# content_category corrections
+# --------------------------------------------------------------------------
+category_overrides:
+  fakeclue-real-ffpp: faces
+  fakeclue-fake-ffpp: faces
+  # fakeclue-*-satellite removed 2026-08-24 (v23 cull -> legacy, not loaded)
+  FDDB_Dataset: faces
+  47-plant-species: plants
+
+# --------------------------------------------------------------------------
+# Same-source cliques: these never straddle a split
+# --------------------------------------------------------------------------
+pair_groups:
+  - [140k-real-fake-faces-real, 140k-real-fake-faces-fake]
+  - [communityforensics-real, communityforensics-fake]
+  - [FantasyID-real, FantasyID-fake]
+  - [flickr-sd3-real, flickr-sd3-fake]        # SD3 generated from the Flickr reals
+  - [cddb-real, cddb-fake]                    # CDDB benchmark: real/fake halves of one release
+  # DFLIP-3K (v21 release): one benchmark release, real sets matched
+  # per-generator to the fake sets -- one same-source clique.
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11, dflip3k-fake-dreamshaper-xl,
+     dflip3k-fake-pixelwave-11]
+  - [fairface, FairFaceGen, FairFaceGen-flux, FairFaceGen-sd35]
+  - [human-digiface1m-synthetic, digi2real]   # digi2real is digiface + arcface realism
+  - [celeb-a-hq, AttGAN, STARGAN, STGAN_CelebA]
+  # (v23 cull 2026-08-24: SDv15R parts 1/3 and human-faces r2-r9 -> legacy;
+  # surviving singletons need no group.)
+  - [imagepulsev2-addremove, imagepulsev2-change, imagepulsev2-angle,
+     imagepulsev2-crop, imagepulsev2-inpaint, imagepulsev2-humanface,
+     imagepulsev2-style]
+  # v22 released holdouts (joined the registry 2026-08-20): real/fake halves
+  # of one release, same-source by construction (the cddb rule).
+  - [ntire-robustaigendetection-real, ntire-robustaigendetection-fake]
+  - [deepfake-identity-isolated-real, deepfake-identity-isolated-fake]  # faceswap on the real half
+  - [sid-set-real, sid-set-synthetic]   # released as saberzl-sid-*, renamed in-registry
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]  # one generation run, two shards
+
+  # --- self-generated semisynthetic edits (generate_edits.py /
+  #     generate_swaps.py --target, see RUNBOOK-SELFGEN.md). Same list as
+  #     overrides.yaml; under this file's empty holdouts the pairs only
+  #     matter for clique batching and the 80/20 carve. ---
+  - [celeb-a-hq, local-inpaint-celeb-a-hq, local-swap-celeb-a-hq,
+     local-edit2-celeb-a-hq, local-fluxfill-celeb-a-hq,
+     local-swapgfp-celeb-a-hq]
+  - [FDDB_Dataset, local-inpaint-FDDB_Dataset, local-swap-FDDB_Dataset,
+     local-edit2-FDDB_Dataset, local-swapgfp-FDDB_Dataset]
+  - [fakeclue-real-ffpp, local-inpaint-fakeclue-real-ffpp,
+     local-swap-fakeclue-real-ffpp, local-edit2-fakeclue-real-ffpp]
+  - [yfcc100m, local-inpaint-yfcc100m, local-edit2-yfcc100m,
+     local-fluxfill-yfcc100m]
+  - [openfake-real, local-inpaint-openfake-real, local-edit2-openfake-real,
+     local-fluxfill-openfake-real]
+  - [FantasyID-real, local-inpaint-FantasyID-real, local-edit2-FantasyID-real]
+  - [Aslan-mingye-OCR-Quality, local-inpaint-Aslan-mingye-OCR-Quality,
+     local-edit2-Aslan-mingye-OCR-Quality,
+     local-fluxfill-Aslan-mingye-OCR-Quality]
+  - [fashionpedia, local-inpaint-fashionpedia, local-edit2-fashionpedia]
+  - [CACD, local-swap-CACD]
+  - [celebs500k, local-swap-celebs500k]
+  - [MAPIR-Faces, local-swap-MAPIR-Faces, local-swapgfp-MAPIR-Faces]
+
+
+# --------------------------------------------------------------------------
+# Shards of one release -> one sampling group
+# --------------------------------------------------------------------------
+  # --- v23 released holdouts (joined the registry 2026-09; gasbench 6ad80db +
+  #     511dc69). Face-manipulation families built ON datasets already in the
+  #     registry, so a source must never land opposite its own manipulated
+  #     pixels. Swappir's 5 entries and ScaleDF's 4 already auto-union by
+  #     shared HF path; these cliques attach each family to its SOURCE, which
+  #     a path join cannot see. build_split_units is union-find, so these
+  #     merge with the existing celeb-a-hq / fairface / ffpp cliques.
+  - [celeb-a-hq, swappir-gpen-celeba-hq, swappir-celeba-hq-roop,
+     swappir-celeba-hq-simswap]
+  - [fairface, swappir-gpen-fairface, swappir-fairface-roop]
+  - [fakeclue-real-ffpp, fakeclue-fake-ffpp,
+     scaledf-ffpp-deepfakes, scaledf-ffpp-face2face]
+shard_groups:
+  # (v23 cull 2026-08-24: human-faces r1-r9, SFHQ part1-4 and SDv15R shard
+  # sets each collapsed to one surviving entry; groups removed.)
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]   # one Gemini 3.1 generation run
+  # DFLIP-3K real subsets: one real-photo pool split per matched generator ->
+  # one sampling share, not three. The two dflip3k fakes stay separate
+  # (different generators on a shared source, the FairFaceGen rule).
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11]
+
+# --------------------------------------------------------------------------
+# Distributional provenance (NOT unioned by default)
+# --------------------------------------------------------------------------
+  # v23 released holdouts: one release each, so they must not take a sampling
+  # group per named entry. Swappir is 5 manipulation methods over 2 sources,
+  # ScaleDF 4 over one release -- left separate they would hold 9 of the 46
+  # fake-face groups (~20% of fake-face mass) between two releases, the same
+  # failure the human-faces r1-r9 note above describes.
+  - [swappir-gpen-celeba-hq, swappir-gpen-fairface, swappir-celeba-hq-roop,
+     swappir-celeba-hq-simswap, swappir-fairface-roop]
+  - [scaledf-ffpp-deepfakes, scaledf-ffpp-face2face, scaledf-e4e,
+     scaledf-diffusionclip]
+distribution_groups:
+  - [ffhq-256, STYLEGAN, StyleGAN3_1024x1024_images, stylegan3_T_FFHQU_processed,
+     MSG_STYLE_GAN]
+  - [celeb-a-hq, MMD_GAN_CelebA]      # unconditional generation, not editing
+
+# --------------------------------------------------------------------------
+# semisynthetic (manipulation) corrections
+# --------------------------------------------------------------------------
+# EMPTIED 2026-08-24: the v23 registry's audited pixel-based taxonomy is now
+# authoritative (see overrides.yaml for the adopted/overruled breakdown).
+semisynthetic_datasets: []
+
+# --------------------------------------------------------------------------
+# Holdouts (SHIP variant -- see header)
+# --------------------------------------------------------------------------
+# SELECTION RULE for this file: hold out ONLY datasets the dev model already
+# scores >=96% on zero-shot. Every dataset it scores poorly on while held out
+# is a public benchmark source we are donating, so those go to train:
+#
+#   folded in (score while held out, step-1000 --small run):
+#     idnet-2025 3.7%, sa-1b-shards 33.3%, flickr-sd3-fake 40.7%,
+#     cc3m 85.2%, casia_web_face 85.2%, taming_transformer_VQGAN 88.9%,
+#     nano-banana-150k 92.6%, Dalle-3-1M 92.6%, fruits-vegetables 92.6%,
+#     communityforensics-real 92.6%, AgeDB/M6Doc/scface/megalith/caltech-256
+#
+# What remains held out is a deliberately EASY but still generator-distinct
+# panel: it costs ~0-4% on 13 of 183 datasets (negligible for public score)
+# and keeps train.py's checkpoint selection anchored on unseen generators
+# rather than on memorised ones. Selection would silently freeze at the
+# step-250 checkpoint if val_xgen were empty (train.py:311 returns sel=0.0),
+# so this panel is load-bearing, not optional.
+#
+# Of the released-v21 holdout datasets: dflip3k-* and deepfakes-qa-15k
+# TRAIN; the other seven are governed by `train_gates` at the bottom of
+# this file (parked in val_stress).
+holdouts:
+  # EXPERIMENT: all dataset-level holdouts dissolved -- every dataset splits
+  # 80/20 into train/val_id via build_splits --val-id-frac 0.20, EXCEPT the
+  # no-degradation experiment's zero-shot probes, governed by train_gates
+  # below: gemini31 pair -> val_stress (primary, in-training trajectory),
+  # dflip3k clique -> test (second family, post-hoc eval). v21 sets stay
+  # folded in (gate flipped true).
+  val_xgen: {}
+  test: {}
+  val_stress: {}
+
+min_datasets_to_hold_out: 3
+
+# --------------------------------------------------------------------------
+# Training gates (see overrides.yaml for the full rationale)
+# --------------------------------------------------------------------------
+# Excluded from train unless flipped true. dflip3k re-gated 2026-08-17
+# as the epoch-x-degradation experiment's zero-shot judge.
+train_gates:
+  # THE no-degradation experiment's primary zero-shot target (2026-08-25).
+  # gemini31-flash-lite is a v22 holdout released post-round: the reigning
+  # winner scored 68-81% on it zero-shot while our degradation-trained model
+  # scored 7.7%/23.1%. Parked in val_stress so BOTH arms (clean vs schedule)
+  # print a per-epoch zero-shot trajectory on deploy AND robust views, while
+  # staying out of train, val_id and val_xgen (selection cannot see it).
+  # val_stress must contain ONLY this pair -- the panel metric is
+  # split-aggregate, so adding anything else muddies the trajectory.
+  # The two shards are one split_unit via pair_groups; both named anyway.
+  # EXPERIMENT CLOSED 2026-08-25, hypothesis rejected: the clean-trained
+  # model ranked gemini31 at AUC 0.75 vs reals with matched-FPR recall ~= raw
+  # (17-21%) while zero-shotting gasstation at AUC 0.972 -- no recoverable
+  # signal, winner's 73-81% => they trained on Gemini-3.x data. Records in
+  # RUNBOOK-NODEGRADE.md + memory. Gate FLIPPED TRUE: gemini31 folds into
+  # train/val_id like any registry dataset (it is public data now).
+  gemini31-zeroshot:
+    include_in_train: true
+    park_in: val_stress
+    fake:
+      - gemini31-flash-lite-train
+      - gemini31-flash-lite-val
+    real: []
+  # Gasstation excluded from the experiment arms (2026-08-25): the box cache
+  # holds ONLY 2026W35 -- the live round-23 week -- and 88% of its samples
+  # (2,459/2,785) carry model_name "unknown", so the gemini leak scan cannot
+  # certify it. Training on the current week's unattributed traffic risks the
+  # target generator leaking into BOTH arms and inflating the "zero-shot"
+  # number. Parked in `test`: out of train and all panels, symmetric across
+  # arms, and post-hoc it doubles as a live-traffic zero-shot readout
+  # (seedream-4-5 is itself an unseen generator). sampler.gasstation_boost
+  # becomes a no-op with no gasstation rows in train -- configs stay
+  # untouched. SHIP: flip include_in_train true after the round's re-pull.
+  # FLIPPED TRUE at experiment close (2026-08-25): the leak-freeze rationale
+  # died with the hypothesis. Gasstation is the x6.5-weighted eval stream --
+  # it trains. Re-pull latest weeks before the ship build and re-run
+  # scan_gasstation_generators.py for the census; check the sampler's printed
+  # p_gasstation/replay after rebuild (config comment: boost 2.5 was sized
+  # for a ~10k pool; revisit toward 5.0 as the pool approaches 8 weeks).
+  gasstation-w35:
+    include_in_train: true
+    park_in: test
+    fake:
+      - gasstation-generated-images
+    real: []
+  # DFLIP-3K re-gated 2026-08-25 as the experiment's SECOND probe family,
+  # parked in `test` (NOT val_stress -- keeps the in-training trajectory
+  # purely gemini31; test is excluded from all panels and evaluated post-hoc
+  # via eval_probes/measure_margins). Gives (a) a second zero-shot readout
+  # and (b) a stylized-REAL side: if the clean arm reproduces the winner's
+  # fake-leaning weakness, dflip3k-real accuracy is where it shows.
+  # FLIPPED TRUE at experiment close: back to the pre-experiment state
+  # (dflip3k trains; the clean arm measured 46-61% on its reals zero-shot --
+  # training on them is what protects the stylized-real flank).
+  dflip3k:
+    include_in_train: true
+    park_in: test
+    fake:
+      - dflip3k-fake-dreamshaper-xl
+      - dflip3k-fake-pixelwave-11
+    real:
+      - dflip3k-real-juggernaut
+      - dflip3k-real-dreamshaper-xl
+      - dflip3k-real-pixelwave-11
+  v21-released:
+    include_in_train: true
+    park_in: val_stress
+    fake:
+      - sdfd
+      - 17-ai-model-images
+      - cddb-fake
+    real:
+      - google-streetview-images
+      - data-art-backup
+      - cddb-real
+      - feyiamujohuman-palm-images

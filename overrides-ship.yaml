@@ -1,0 +1,194 @@
+# SHIP-MODEL split config. Identical to overrides.yaml EXCEPT the holdouts
+# section: the model trained under this file is the one that gets submitted.
+#
+# Rationale (2026-08-06, after the first full dinov3 benchmark): the dev
+# protocol holds public eval datasets out of training for honest selection,
+# but every point conceded there is a real point on the leaderboard -- e.g.
+# face-swap (in dev `test`) scored 24.2% while the reigning winner, who
+# evidently trains on it, scores 98.9%. The ship split therefore:
+#   - empties `test` and `val_stress` (all their datasets return to train --
+#     incl. face-swap, ffhq-256, casia_web_face);
+#   - rotates `val_xgen` to datasets the dev model already generalises to at
+#     96-100% zero-shot (the former test suite), so selection still measures
+#     held-out-generator performance while conceding almost nothing;
+#   - folds the old val_xgen (nano-banana 84.7%, taming 86.6%, megalith 84.4%,
+#     flickr-sd3, control-face... the measured weak holdouts) into train.
+#     EXCEPT control-face-10k, which stays held out as the faces probe.
+# Use: build_splits.py --manifest ... --overrides overrides-ship.yaml --write
+# after freezing hyperparameters with the dev split. Everything except the
+# holdouts section is byte-identical to overrides.yaml -- keep them in sync.
+
+# --------------------------------------------------------------------------
+# content_category corrections
+# --------------------------------------------------------------------------
+category_overrides:
+  fakeclue-real-ffpp: faces
+  fakeclue-fake-ffpp: faces
+  # fakeclue-*-satellite removed 2026-08-24 (v23 cull -> legacy, not loaded)
+  FDDB_Dataset: faces
+  47-plant-species: plants
+
+# --------------------------------------------------------------------------
+# Same-source cliques: these never straddle a split
+# --------------------------------------------------------------------------
+pair_groups:
+  - [140k-real-fake-faces-real, 140k-real-fake-faces-fake]
+  - [communityforensics-real, communityforensics-fake]
+  - [FantasyID-real, FantasyID-fake]
+  - [flickr-sd3-real, flickr-sd3-fake]        # SD3 generated from the Flickr reals
+  - [cddb-real, cddb-fake]                    # CDDB benchmark: real/fake halves of one release
+  # DFLIP-3K (v21 release): one benchmark release, real sets matched
+  # per-generator to the fake sets -- one same-source clique.
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11, dflip3k-fake-dreamshaper-xl,
+     dflip3k-fake-pixelwave-11]
+  - [fairface, FairFaceGen, FairFaceGen-flux, FairFaceGen-sd35]
+  - [human-digiface1m-synthetic, digi2real]   # digi2real is digiface + arcface realism
+  - [celeb-a-hq, AttGAN, STARGAN, STGAN_CelebA]
+  # (v23 cull 2026-08-24: SDv15R parts 1/3 and human-faces r2-r9 -> legacy;
+  # surviving singletons need no group.)
+  - [imagepulsev2-addremove, imagepulsev2-change, imagepulsev2-angle,
+     imagepulsev2-crop, imagepulsev2-inpaint, imagepulsev2-humanface,
+     imagepulsev2-style]
+  # v22 released holdouts (joined the registry 2026-08-20): real/fake halves
+  # of one release, same-source by construction (the cddb rule).
+  - [ntire-robustaigendetection-real, ntire-robustaigendetection-fake]
+  - [deepfake-identity-isolated-real, deepfake-identity-isolated-fake]  # faceswap on the real half
+  - [sid-set-real, sid-set-synthetic]   # released as saberzl-sid-*, renamed in-registry
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]  # one generation run, two shards
+
+
+# --------------------------------------------------------------------------
+# Shards of one release -> one sampling group
+# --------------------------------------------------------------------------
+shard_groups:
+  # (v23 cull 2026-08-24: human-faces r1-r9, SFHQ part1-4 and SDv15R shard
+  # sets each collapsed to one surviving entry; groups removed.)
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]   # one Gemini 3.1 generation run
+  # DFLIP-3K real subsets: one real-photo pool split per matched generator ->
+  # one sampling share, not three. The two dflip3k fakes stay separate
+  # (different generators on a shared source, the FairFaceGen rule).
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11]
+
+# --------------------------------------------------------------------------
+# Distributional provenance (NOT unioned by default)
+# --------------------------------------------------------------------------
+distribution_groups:
+  - [ffhq-256, STYLEGAN, StyleGAN3_1024x1024_images, stylegan3_T_FFHQU_processed,
+     MSG_STYLE_GAN]
+  - [celeb-a-hq, MMD_GAN_CelebA]      # unconditional generation, not editing
+
+# --------------------------------------------------------------------------
+# semisynthetic (manipulation) corrections
+# --------------------------------------------------------------------------
+# EMPTIED 2026-08-24: the v23 registry's audited pixel-based taxonomy is now
+# authoritative (see overrides.yaml for the adopted/overruled breakdown).
+semisynthetic_datasets: []
+
+# --------------------------------------------------------------------------
+# Holdouts (SHIP variant -- see header)
+# --------------------------------------------------------------------------
+# SELECTION RULE for this file: hold out ONLY datasets the dev model already
+# scores >=96% on zero-shot. Every dataset it scores poorly on while held out
+# is a public benchmark source we are donating, so those go to train:
+#
+#   folded in (score while held out, step-1000 --small run):
+#     idnet-2025 3.7%, sa-1b-shards 33.3%, flickr-sd3-fake 40.7%,
+#     cc3m 85.2%, casia_web_face 85.2%, taming_transformer_VQGAN 88.9%,
+#     nano-banana-150k 92.6%, Dalle-3-1M 92.6%, fruits-vegetables 92.6%,
+#     communityforensics-real 92.6%, AgeDB/M6Doc/scface/megalith/caltech-256
+#
+# What remains held out is a deliberately EASY but still generator-distinct
+# panel: it costs ~0-4% on 13 of 183 datasets (negligible for public score)
+# and keeps train.py's checkpoint selection anchored on unseen generators
+# rather than on memorised ones. Selection would silently freeze at the
+# step-250 checkpoint if val_xgen were empty (train.py:311 returns sel=0.0),
+# so this panel is load-bearing, not optional.
+#
+# Of the released-v21 holdout datasets: dflip3k-* and deepfakes-qa-15k
+# TRAIN; the other seven are governed by `train_gates` at the bottom of
+# this file (parked in val_stress).
+holdouts:
+  # Fake: diverse x5, faces x1.  Real: diverse x5 (communityforensics-real
+  # arrives via its pair), faces x1.  P(fake) = 0.50.
+  val_xgen:
+    fake:
+      - ideogram-27k                # diverse -- commercial T2I    (100%)
+      - imagine-grok                # diverse -- xAI               (100%)
+      - klingai-images              # diverse -- Kling             (100%)
+      - leonardo-stablecog          # diverse -- Leonardo          (100%)
+      - communityforensics-fake     # diverse -- content-matched pair (96.3%)
+      - control-face-10k            # faces   -- conditioned diffusion (100%)
+    real:
+      # megalith-10m ROTATED OUT 2026-08-11: its "100%" was a 27-sample
+      # --small read; the 352-sample final-checkpoint run measured 88.6%
+      # held out -- it violated this panel's own >=96% rule and was
+      # donating points. Folded into train; sa-1b-shards (96.0% held out
+      # at 352 samples in the same run) takes its diverse slot.
+      - sa-1b-shards                # diverse (96.0% @ 352, held out)
+      - caltech-256                 # diverse (100%)
+      - uagd                        # diverse (98.0% @ 352, held out)
+      - flickr30k                   # diverse (96.3%)
+      # communityforensics-real joins via pair_groups -> diverse x5
+      # wider-face ROTATED OUT 2026-08-11 for the same reason: 90.9% held
+      # out at 352 samples (the old 96.3% was 26/27). Folded into train;
+      # AgeDB takes the faces slot -- CONFIRM its number in the full log
+      # (it is in the truncated a-e section); if it reads <96%, swap in the
+      # best >=96% held-out faces real instead.
+      - AgeDB                       # faces (confirm >=96% in full log)
+
+  # SHIP: no untouched test split -- the full gasbench run on the exported
+  # submission is the final gate. Empty mapping keeps the schema.
+  test: {}
+
+  # casia_web_face returns to train (85.2% held out = donated points).
+  # ffhq-256 stays: it reads 96.3% held out, so it costs ~1 image, and it is
+  # the resolution-shortcut canary -- the one measurement that catches the
+  # model learning "small upsampled image = fake", which is the failure mode
+  # that would wreck the hidden real holdouts. Report-only, never selected on.
+  val_stress:
+    real:
+      - ffhq-256
+
+# Categories with fewer than this many datasets keep every dataset in train.
+min_datasets_to_hold_out: 3
+
+# --------------------------------------------------------------------------
+# Training gates (see overrides.yaml for the full rationale)
+# --------------------------------------------------------------------------
+# Excluded from train unless flipped true. dflip3k re-gated 2026-08-17
+# as the epoch-x-degradation experiment's zero-shot judge.
+train_gates:
+  # DFLIP-3K held OUT of training (re-gated 2026-08-17 for the epoch x
+  # degradation experiment): the five-dataset clique is the zero-shot JUDGE
+  # metric -- report-only in val_stress so checkpoint selection cannot
+  # optimize for it. Flip include_in_train: true to fold back into train.
+  dflip3k:
+    include_in_train: false
+    park_in: val_stress
+    fake:
+      - dflip3k-fake-dreamshaper-xl
+      - dflip3k-fake-pixelwave-11
+    real:
+      - dflip3k-real-juggernaut
+      - dflip3k-real-dreamshaper-xl
+      - dflip3k-real-pixelwave-11
+  v21-released:
+    include_in_train: false
+    park_in: val_stress
+    fake:
+      - sdfd
+      - 17-ai-model-images
+      - cddb-fake
+    real:
+      - google-streetview-images
+      - data-art-backup
+      - cddb-real
+      - feyiamujohuman-palm-images
+
+# extra_datasets removed 2026-08-17: the locally staged aesthetic reals
+# (laion-aes65, unsplash-lite) are EXCLUDED for the epoch-x-degradation
+# experiment -- dflip3k reals are aesthetic-LAION-style, so training on
+# them would confound the method-vs-data attribution. Re-add via
+# prepare_reals.py + an extra_datasets block when the experiment ends.

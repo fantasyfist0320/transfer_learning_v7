@@ -1,0 +1,345 @@
+# Corrections and split designations layered on the gasbench registry.
+#
+# Kept out of build_manifest.py so the registry join stays a pure function and
+# every judgement call is reviewable in one place. The manifest carries both
+# `content_category` (YAML verbatim) and `content_category_fixed` (after these
+# overrides) so audit_shortcuts.py can measure whether the fixes mattered.
+
+# --------------------------------------------------------------------------
+# content_category corrections
+# --------------------------------------------------------------------------
+# Each is justified by the registry entry itself, not by guesswork -- mostly by
+# include_paths, which names the subdirectory being extracted.
+category_overrides:
+  # include_paths: [data/real/ff++/] and [data/fake/ff++/] -- FaceForensics++
+  fakeclue-real-ffpp: faces
+  fakeclue-fake-ffpp: faces
+  # fakeclue-*-satellite removed 2026-08-24: the v23 registry cull moved both
+  # to legacy_images.yaml (not loaded), so the aerial correction is moot.
+  # Face Detection Data Set and Benchmark.
+  FDDB_Dataset: faces
+  # Filed under `animals` in the registry; it is plants.
+  47-plant-species: plants
+  # Filed under the `# -- faces --` comment block but already correctly
+  # categorised in the YAML field. Listed here only as a reminder that the
+  # section comments in real_images.yaml are stale and must not be parsed:
+  #   Mandrillus-Face -> animals, WarpDoc_merged -> documents,
+  #   nepali-cultural-dress-dataset -> humans.
+
+# --------------------------------------------------------------------------
+# Same-source cliques: these never straddle a split
+# --------------------------------------------------------------------------
+# Shared HF `path` is detected automatically (FakeClue spans 9 entries,
+# SyntheticFacesHQ 4, OpenFake 2). These are the ones a path join cannot see.
+pair_groups:
+  # --- explicit real/fake pairs built from the same source images ---
+  - [140k-real-fake-faces-real, 140k-real-fake-faces-fake]
+  - [communityforensics-real, communityforensics-fake]
+  - [FantasyID-real, FantasyID-fake]
+  - [flickr-sd3-real, flickr-sd3-fake]        # SD3 generated from the Flickr reals
+  - [cddb-real, cddb-fake]                    # CDDB benchmark: real/fake halves of one release
+  # DFLIP-3K (v21 release): one benchmark release, real sets matched
+  # per-generator to the fake sets. All five entries are one same-source
+  # clique so no real ever lands opposite its content-matched fake.
+  # (dflip3k-real-juggernaut has no released fake counterpart but shares the
+  # real pool.)
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11, dflip3k-fake-dreamshaper-xl,
+     dflip3k-fake-pixelwave-11]
+
+  # --- fakes generated FROM a real dataset in this same registry ---
+  - [fairface, FairFaceGen, FairFaceGen-flux, FairFaceGen-sd35]
+  - [human-digiface1m-synthetic, digi2real]   # digi2real is digiface + arcface realism
+
+  # --- attribute-editing GANs: these transform SPECIFIC CelebA images, so a
+  #     real image and its edited version are a genuine per-image pair ---
+  - [celeb-a-hq, AttGAN, STARGAN, STGAN_CelebA]
+
+  # --- shards of a single generation run or release ---
+  # (v23 cull 2026-08-24: SDv15R parts 1/3 and human-faces r2-r9 moved to
+  # legacy; the surviving singletons -- part0, r1 -- need no group.)
+  - [imagepulsev2-addremove, imagepulsev2-change, imagepulsev2-angle,
+     imagepulsev2-crop, imagepulsev2-inpaint, imagepulsev2-humanface,
+     imagepulsev2-style]
+
+  # --- v22 released holdouts (joined the registry 2026-08-20) ---
+  # Real/fake halves of one release: same-source by construction, so a real
+  # must never land opposite its content-matched fake (the cddb rule).
+  - [ntire-robustaigendetection-real, ntire-robustaigendetection-fake]
+  - [deepfake-identity-isolated-real, deepfake-identity-isolated-fake]  # faceswap on the real half
+  - [sid-set-real, sid-set-synthetic]   # released as saberzl-sid-*, renamed in-registry
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]  # one generation run, two shards
+
+  # --- self-generated semisynthetic edits (generate_edits.py /
+  #     generate_swaps.py --target, see RUNBOOK-SELFGEN.md) ---
+  # Each edit set is built FROM its source's train rows, so the pair keeps
+  # them in one split_unit: the source can never land in a holdout opposite
+  # its own edited pixels, and clique pairing serves real/edited pairs in the
+  # same batch. Sources here are deliberately NOT in any holdout list --
+  # wider-face/AgeDB/M6Doc_test were rejected as sources for exactly that
+  # reason (the pair would drag the edit set into val_xgen with them).
+  # v2 arms added 2026-08-31 (RUNBOOK-SELFGEN "v2 arms"): edit2 (new mask
+  # families), fluxfill (DiT filler), swapgfp (enhanced swaps) join their
+  # source's clique for the same leakage reason.
+  - [celeb-a-hq, local-inpaint-celeb-a-hq, local-swap-celeb-a-hq,
+     local-edit2-celeb-a-hq, local-fluxfill-celeb-a-hq,
+     local-swapgfp-celeb-a-hq]
+  - [FDDB_Dataset, local-inpaint-FDDB_Dataset, local-swap-FDDB_Dataset,
+     local-edit2-FDDB_Dataset, local-swapgfp-FDDB_Dataset]
+  - [fakeclue-real-ffpp, local-inpaint-fakeclue-real-ffpp,
+     local-swap-fakeclue-real-ffpp, local-edit2-fakeclue-real-ffpp]
+  - [yfcc100m, local-inpaint-yfcc100m, local-edit2-yfcc100m,
+     local-fluxfill-yfcc100m]
+  - [openfake-real, local-inpaint-openfake-real, local-edit2-openfake-real,
+     local-fluxfill-openfake-real]
+  - [FantasyID-real, local-inpaint-FantasyID-real, local-edit2-FantasyID-real]
+  - [Aslan-mingye-OCR-Quality, local-inpaint-Aslan-mingye-OCR-Quality,
+     local-edit2-Aslan-mingye-OCR-Quality,
+     local-fluxfill-Aslan-mingye-OCR-Quality]
+  - [fashionpedia, local-inpaint-fashionpedia, local-edit2-fashionpedia]
+  - [CACD, local-swap-CACD]
+  - [celebs500k, local-swap-celebs500k]
+  - [MAPIR-Faces, local-swap-MAPIR-Faces, local-swapgfp-MAPIR-Faces]
+
+
+# --------------------------------------------------------------------------
+# Shards of one release -> one sampling group
+# --------------------------------------------------------------------------
+# The registry lists shards of a single generation run as separate `name`
+# entries, and the sampler's cascade gives every named dataset its own group
+# share. Measured effect: human-faces-dataset-r1..r9 is 9 of the 43 fake-face
+# groups and therefore takes 20.9% of ALL fake-face sampling mass -- one
+# release dominating a fifth of the signal for that whole cell.
+#
+# These stay separate datasets everywhere else (splitting, reporting); only the
+# sampler's `group` key collapses them.
+#
+# NOT listed here, deliberately: fakeclue-* are different CONTENT subsets
+# (ff++/genimage/satellite/doc), imagepulsev2-* are different OPERATIONS
+# (inpaint/addremove/style), and FairFaceGen/-flux/-sd35 are different
+# GENERATORS on a shared source. Those are genuinely distinct groups.
+  # --- v23 released holdouts (joined the registry 2026-09; gasbench 6ad80db +
+  #     511dc69). Face-manipulation families built ON datasets already in the
+  #     registry, so a source must never land opposite its own manipulated
+  #     pixels. Swappir's 5 entries and ScaleDF's 4 already auto-union by
+  #     shared HF path; these cliques attach each family to its SOURCE, which
+  #     a path join cannot see. build_split_units is union-find, so these
+  #     merge with the existing celeb-a-hq / fairface / ffpp cliques.
+  - [celeb-a-hq, swappir-gpen-celeba-hq, swappir-celeba-hq-roop,
+     swappir-celeba-hq-simswap]
+  - [fairface, swappir-gpen-fairface, swappir-fairface-roop]
+  - [fakeclue-real-ffpp, fakeclue-fake-ffpp,
+     scaledf-ffpp-deepfakes, scaledf-ffpp-face2face]
+shard_groups:
+  # (v23 cull 2026-08-24: the human-faces r1-r9, SFHQ part1-4 and SDv15R
+  # part0/1/3 shard sets each collapsed to one surviving entry -- the registry
+  # cull did this section's dedup job for it, so those groups are gone. The
+  # measured 20.9%-of-fake-faces effect described above is history, kept for
+  # the rationale.)
+  - [gemini31-flash-lite-train, gemini31-flash-lite-val]   # one Gemini 3.1 generation run
+  # The three DFLIP-3K real subsets are slices of one real-photo pool, split
+  # by which generator they were matched against -- one release, so one
+  # sampling share of the real-faces cell, not three. The two dflip3k FAKES
+  # stay separate groups: dreamshaper-xl and pixelwave-11 are different
+  # generators on a shared source (the FairFaceGen rule above).
+  - [dflip3k-real-juggernaut, dflip3k-real-dreamshaper-xl,
+     dflip3k-real-pixelwave-11]
+
+# --------------------------------------------------------------------------
+# Distributional provenance (NOT unioned by default)
+# --------------------------------------------------------------------------
+# A generator that was *trained on* a corpus is a weaker relationship than a
+# generator that *transformed specific images* from it. StyleGAN trained on
+# FFHQ emits novel faces; it does not reconstruct particular FFHQ photographs.
+# So there is no per-image leakage, only distributional overlap -- and for a
+# held-out-generator split what matters is that the generator is unseen, which
+# is satisfied either way.
+#
+# Keeping these out of `pair_groups` is not laziness, it is a measured trade:
+# unioning ffhq-256 with its four StyleGAN descendants would drag 4 of the 9
+# stylegan datasets out of train purely because one small real corpus was
+# designated a stress canary.
+#
+# Pass --strict-provenance to build_splits.py to union these too, at that cost.
+  # v23 released holdouts: one release each, so they must not take a sampling
+  # group per named entry. Swappir is 5 manipulation methods over 2 sources,
+  # ScaleDF 4 over one release -- left separate they would hold 9 of the 46
+  # fake-face groups (~20% of fake-face mass) between two releases, the same
+  # failure the human-faces r1-r9 note above describes.
+  - [swappir-gpen-celeba-hq, swappir-gpen-fairface, swappir-celeba-hq-roop,
+     swappir-celeba-hq-simswap, swappir-fairface-roop]
+  - [scaledf-ffpp-deepfakes, scaledf-ffpp-face2face, scaledf-e4e,
+     scaledf-diffusionclip]
+distribution_groups:
+  - [ffhq-256, STYLEGAN, StyleGAN3_1024x1024_images, stylegan3_T_FFHQU_processed,
+     MSG_STYLE_GAN]
+  - [celeb-a-hq, MMD_GAN_CelebA]      # unconditional generation, not editing
+
+# --------------------------------------------------------------------------
+# semisynthetic (manipulation) corrections
+# --------------------------------------------------------------------------
+# EMPTIED 2026-08-24. This list existed because the old registry could not
+# express manipulation (media_type: semisynthetic on only 2 of 91 fakes).
+# The v23 registry ships an audited, pixel-based 3-class taxonomy -- real |
+# synthetic | semisynthetic, where semisynthetic means captured pixels
+# retained alongside localized generated content -- so the registry
+# media_type is now authoritative. Every correction here was either:
+#   ADOPTED by the audit (now media_type: semisynthetic in-registry):
+#     deepfakeface-inpainting, fakeclue-fake-ffpp, deepfakes-qa-15k
+#     (joining face-swap and the new deepfake-identity-isolated-fake);
+#   OVERRULED by the audit (media_type: synthetic -- editing exclusively
+#     synthetic/rendered source media stays synthetic under the pixel rule):
+#     AttGAN, STARGAN, STGAN_CelebA, imagepulsev2-* (6 ops), digi2real,
+#     pica-100k;
+#   or GONE from the active registry: deepfake-insight (excluded, unsplittable
+#     labels), fakeclue-fake-doc (legacy). receipts-i2i also flipped
+#     semisynthetic -> synthetic in the registry.
+# If the manipulation probes (face-swap and kin) degrade next run, revisit
+# the OVERRULED set here -- do not edit the registry.
+semisynthetic_datasets: []
+
+# --------------------------------------------------------------------------
+# Holdouts
+# --------------------------------------------------------------------------
+# Designations propagate to the whole same-source clique, so naming one member
+# holds out all of them. build_splits.py --dry-run prints the realised matrix.
+#
+# Of the released-v21 holdout datasets: dflip3k-* and deepfakes-qa-15k
+# TRAIN; the other seven are governed by `train_gates` at the bottom of
+# this file (parked in val_stress).
+holdouts:
+  # Selection signal.
+  #
+  # The real side is chosen to MATCH the fake side category by category, not to
+  # maximise coverage. Both MCC and Brier depend on the class prior, and the
+  # benchmark's is ~0.5 (uniform sampling over ~89 real / ~91 synthetic
+  # datasets), so a holdout at P(fake)=0.33 will not track the leaderboard. A
+  # real dataset in a category with no held-out fake cannot contribute a
+  # comparison -- it only skews the prior -- so it is worth more in train.
+  #
+  # Fake side: diverse x3, faces x2, documents x1. Real side matches exactly.
+  # `flickr-sd3-real` and `communityforensics-real` are pulled in automatically
+  # by their pair_group, so they are counted but not listed.
+  val_xgen:
+    fake:
+      - nano-banana-150k            # diverse  -- current-gen commercial T2I
+      - ideogram-27k                # diverse  -- second modern vendor
+      - flickr-sd3-fake             # diverse  -- content-matched pair
+      - taming_transformer_VQGAN    # faces    -- VQ/autoregressive, a different paradigm
+      - control-face-10k            # faces    -- conditioned diffusion (ip-adapter stays in train)
+      - idnet-2025                  # documents-- the only non-mixed document fake
+    real:
+      # diverse x3, counting flickr-sd3-real which arrives via its pair
+      - megalith-10m
+      - caltech-256
+      - wider-face                  # faces
+      - AgeDB                       # faces
+      - M6Doc_test                  # documents
+      # Deliberately NOT held out -- their categories have no held-out fake, so
+      # they would only unbalance the prior: stanford-dogs (animals),
+      # hagrid-gestures (humans), foodseg103 (food), 60k-car (vehicles),
+      # mmmu (medical), vtuav-dataset-test-lt-001 (aerial, and the reason
+      # `aerial` showed up single-label in val_xgen).
+
+  # Touched once, at the very end. Same matching rule.
+  # Fake side: diverse x6. Real side matches: diverse x6.
+  test:
+    fake:
+      - Dalle-3-1M                  # diverse
+      - imagine-grok                # diverse
+      - klingai-images              # diverse
+      - leonardo-stablecog          # diverse
+      - aura-imagegen               # diverse
+      - communityforensics-fake     # diverse -- content-matched pair
+      # face-swap REMOVED 2026-08-07 and returned to train. Held out, it was
+      # an honest probe and answered its question: swap detection does NOT
+      # generalise from the other manipulation data (dinov3 24.2%, clip 14.8%
+      # zero-shot). It is public benchmark data the leading miner evidently
+      # trains on (98.9%), so continuing to hold it out only donates the
+      # dataset. The generalisation question it used to answer is now asked
+      # by control-face-10k (faces, val_xgen) instead.
+    real:
+      # diverse x6, counting communityforensics-real which arrives via its pair
+      - sa-1b-shards
+      - uagd
+      - fruits-vegetables
+      - flickr30k
+      - cc3m
+      # scface_dataset follows face-swap back to train: with no held-out fake
+      # in `faces`, a real faces corpus here only skews the prior (the rule
+      # stated above). Dropped earlier for the same reason: SmartDoc-QA
+      # (documents), sea-animals-image (animals), fashionpedia (humans),
+      # SoloFace (surplus faces).
+
+  # Reported every eval, never selected on. These are the sub-256px real
+  # corpora -- the resolution-shortcut canaries. If they were in val_xgen,
+  # checkpoint selection would partly be selecting for "got better at
+  # exploiting resolution", which is the one thing that must not be optimised.
+  #
+  # DELIBERATELY SMALL. The first run held out seven of these and the benchmark
+  # then scored ffhq-256 at 0.207 and or-real-id at 0.310 -- the model called
+  # 60-79% of small real images fake. Part of that is the shortcut itself, but
+  # part was self-inflicted: a model can only learn "small upsampled real face
+  # is real" from examples of small upsampled real faces, and we had removed
+  # almost all of them. Train had 21 real face sources against 40 fake, and
+  # five of the eight missing reals were sitting in this list.
+  #
+  # Two datasets is enough to measure the canary. The rest belong in training,
+  # where they are the counterexamples the false-positive problem needs.
+  val_stress:
+    real:
+      - ffhq-256              # 256px aligned faces; the worst benchmark score (0.207)
+      - casia_web_face        # 112px faces; the most extreme upsample in the corpus
+      # Returned to train after run_1: glint360k, lfw, or-real-id,
+      # ms-coco-unique, open-image-v7 (~2,500 low-resolution real images).
+
+# Categories with fewer than this many datasets keep every dataset in train.
+# Holding out the single `currency` dataset would mean the model never sees a
+# banknote yet is scored on banknotes -- a guaranteed Brier loss, not a
+# generalisation test.
+min_datasets_to_hold_out: 3
+
+# --------------------------------------------------------------------------
+# Training gates: datasets excluded from train unless flipped to true
+# --------------------------------------------------------------------------
+# park_in decides where excluded datasets go: val_xgen is measured AND
+# steers checkpoint selection; val_stress is measured every eval but never
+# selected on.
+# NOTE: dflip3k-* is GATED below (re-added 2026-08-17): all five
+# datasets are held out of training as the experiment's judge metric.
+train_gates:
+  # DFLIP-3K held OUT of training (re-gated 2026-08-17 for the epoch x
+  # degradation experiment): the five-dataset clique is the zero-shot JUDGE
+  # metric -- report-only in val_stress so checkpoint selection cannot
+  # optimize for it. Flip include_in_train: true to fold back into train.
+  dflip3k:
+    include_in_train: false
+    park_in: val_stress
+    fake:
+      - dflip3k-fake-dreamshaper-xl
+      - dflip3k-fake-pixelwave-11
+    real:
+      - dflip3k-real-juggernaut
+      - dflip3k-real-dreamshaper-xl
+      - dflip3k-real-pixelwave-11
+  # Remaining v21 released holdouts (user decision 2026-08-11): the model
+  # already scored well on these zero-shot, so training on them buys little
+  # and holding them out keeps them honest generalization probes. Parked in
+  # val_stress (report-only) rather than val_xgen so they do not disturb the
+  # category-matched selection panel (streetview/art/palm reals have no
+  # matching held-out fakes -- in val_xgen they would only skew the prior).
+  # NOT gated: deepfakes-qa-15k stays in TRAIN -- it is faceswap
+  # manipulation data, the class measured 19-24 points weak, not a
+  # generalization probe.
+  v21-released:
+    include_in_train: false
+    park_in: val_stress
+    fake:
+      - sdfd
+      - 17-ai-model-images
+      - cddb-fake
+    real:
+      - google-streetview-images
+      - data-art-backup
+      - cddb-real
+      - feyiamujohuman-palm-images
