@@ -48,11 +48,6 @@ Image.MAX_IMAGE_PIXELS = 512_000_000
 
 KINDS = ("real", "synthetic", "semisynthetic")
 
-# How far a realized kind share may sit from its target before the sampler
-# calls it out. 0.02 is well inside sampling noise and well outside the 0.155
-# miss the 2026-09-08 run shipped with.
-KIND_TOL = 0.02
-
 
 def _kind_shares(df: pd.DataFrame, kb: dict[str, float]) -> np.ndarray:
     """Per-row share of its (label, category) cell that its `kind` should carry.
@@ -247,26 +242,6 @@ def balanced_weights(df: pd.DataFrame, *, gamma: float = 0.5,
         w = w / w.sum()
 
     amp = w * n
-
-    # Reachability of the kind targets. _kind_shares applies kind_balance
-    # INSIDE each (label, category) cell, so a kind is capped at the mass of
-    # the cells it actually occupies:
-    #     ceiling(k) = label_w[l(k)] * sum(q_c over cells where k appears)
-    # Nothing computed this before, so a request the pool cannot satisfy --
-    # semisynthetic 0.25 against a faces-only semi pool -- realized at 0.0952
-    # and still printed "[balanced]". The numbers below make that visible.
-    kind_target: dict[str, float] = {}
-    kind_ceiling: dict[str, float] = {}
-    if kind_balance and "kind" in df.columns:
-        kb_tot = sum(kb.values())
-        kind_target = {k: kb[k] / kb_tot for k in KINDS}
-        kser = df["kind"].astype(str).to_numpy()
-        for k in KINDS:
-            lk = 0 if k == "real" else 1
-            sel = (kser == k) & (lab == lk) & keep
-            kind_ceiling[k] = label_w[lk] * sum(
-                q.get(c, 0.0) for c in set(cat[sel].tolist()))
-
     # Per-dataset mass, for the report: concentration is otherwise invisible
     # (e.g. v23: the 5 semi datasets carry ~9.7% of ALL training mass at
     # ~3.4x replay each -- fine, but only if someone can see it).
@@ -291,8 +266,6 @@ def balanced_weights(df: pd.DataFrame, *, gamma: float = 0.5,
                       if ((df["kind"].astype(str) == k).to_numpy() & (w > 0)).any()}
                      if "kind" in df.columns else {}),
         "kind_balance": dict(kind_balance) if kind_balance else None,
-        "kind_target": kind_target,
-        "kind_ceiling": kind_ceiling,
         "gasstation_boost": float(gasstation_boost),
         "p_gasstation": float(w[df["dataset"].astype(str).str.lower()
                                .str.contains("gasstation").to_numpy()].sum()),
@@ -307,39 +280,9 @@ def balanced_weights(df: pd.DataFrame, *, gamma: float = 0.5,
               f"replay {report['amp_min']:.2f}x..{report['amp_max']:.2f}x  "
               f"servable {report['n_servable']:,}/{n:,}")
         if report["p_kind"]:
-            tgt, ceil_ = report["kind_target"], report["kind_ceiling"]
-            # The tag used to read "[balanced]" whenever kind_balance was
-            # merely SET, which is how a 0.25 semisynthetic request that
-            # realized 0.0952 survived a full 15,000-step run unremarked.
-            # It now reports the outcome, not the intent.
-            ok = all(abs(report["p_kind"].get(k, 0.0) - tgt[k]) <= KIND_TOL
-                     for k in KINDS) if tgt else True
             print("[sampler] P(kind): " + "  ".join(
                 f"{k}={v:.4f}" for k, v in report["p_kind"].items() if v > 0)
-                + ("  [unbalanced]" if not kind_balance else
-                   "  [balanced]" if ok else "  [TARGET NOT MET]"))
-            if tgt:
-                print("[sampler] kind target/realized/ceiling: " + "  ".join(
-                    f"{k}={tgt[k]:.3f}/{report['p_kind'].get(k, 0.0):.3f}"
-                    f"/{ceil_.get(k, 0.0):.3f}" for k in KINDS))
-                unreachable = [k for k in KINDS
-                               if tgt[k] > ceil_.get(k, 0.0) + 1e-9]
-                if unreachable:
-                    print("[sampler] WARNING kind_balance is UNREACHABLE for "
-                          f"{unreachable}. _kind_shares applies the target "
-                          "inside each (label, category) cell, so a kind is "
-                          "capped at label_w * sum(q_c) over the cells it "
-                          "occupies -- the ceiling above. Raising the target "
-                          "cannot pass that cap; only giving the kind more "
-                          "CATEGORY coverage can. To correct the objective "
-                          "without more data, set loss.kind_class_weights.")
-                missed = [k for k in KINDS if k not in unreachable
-                          and abs(report["p_kind"].get(k, 0.0)
-                                  - tgt[k]) > KIND_TOL]
-                if missed:
-                    print(f"[sampler] WARNING kind shares miss target by more "
-                          f"than {KIND_TOL} for {missed} -- reachable, so "
-                          f"check max_replay / gasstation_boost.")
+                + ("  [balanced]" if kind_balance else "  [unbalanced]"))
             if report["amp_kind"]:
                 print("[sampler] peak replay by kind: " + "  ".join(
                     f"{k}={v:.1f}x" for k, v in report["amp_kind"].items()))

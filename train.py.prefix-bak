@@ -33,10 +33,8 @@ from torch.utils.data import DataLoader
 
 from branches import BRANCHES, resolve
 from build_splits import _stable_frac
-from calibrate import (blended_sn34, class_balance_weights, compose_3class,
-                       crossfit_temperature, fit_temperature,
-                       fit_type_posterior, multiclass_metrics,
-                       sn34_from_probs, y3_class_weights)
+from calibrate import (blended_sn34, class_balance_weights,
+                       crossfit_temperature, fit_temperature, sn34_from_probs)
 from data import (BalancedSampler, ManifestDataset, ViewConfig,
                   balanced_weights, clique_pairs, worker_init_fn)
 from model import BranchModel, binary_margin, collapse_binary, type_margin
@@ -47,17 +45,14 @@ REQUIRED = {
     "training": ["epochs", "batch_size", "grad_accum_steps", "lr",
                  "weight_decay", "warmup_ratio", "max_grad_norm", "amp",
                  "ema_decay", "eval_every"],
-    # multiclass_selection / type_prior are OPTIONAL (see OPTIONAL_TRAINING).
     "loss": ["kl_consistency", "brier", "brier_ramp", "label_smoothing",
-             "type_weight", "type_label_smoothing", "kind_class_weights"],
+             "type_weight", "type_label_smoothing"],
     "lora": ["r", "alpha", "dropout"],
 }
-# Despite the name this is the allowlist for OPTIONAL keys in every section
-# validate_config checks, not just `data`.
 OPTIONAL_DATA = ("clean_view_recompress", "resample_jitter", "laundering",
                  "selection", "gasstation_boost", "degradation_schedule",
                  "use_degradation_schedule", "view_b", "eval_max_rows",
-                 "ladder_level_probs", "multiclass_selection", "type_prior")
+                 "ladder_level_probs")
 
 
 def validate_config(cfg: dict) -> None:
@@ -209,57 +204,11 @@ def symmetric_kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
                   + F.kl_div(lb, la.exp(), reduction="batchmean"))
 
 
-def brier_loss(z: torch.Tensor, y: torch.Tensor,
-               w: torch.Tensor | None = None) -> torch.Tensor:
+def brier_loss(z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # p_notreal = 1 - softmax[0]: K-generic, matches the deployed binary
     # collapse (gasbench scores binary MCC/Brier on exactly this quantity).
     p = 1.0 - F.softmax(z, -1)[:, 0]
-    se = (p - y.float()) ** 2
-    if w is None:
-        return se.mean()
-    return (se * w).sum() / w.sum().clamp_min(1e-12)
-
-
-def kind_weights(y3: torch.Tensor, n_classes: int = 3) -> torch.Tensor:
-    """Per-row weights giving every kind PRESENT in the batch equal total mass.
-
-    Why this exists. The sampler cannot deliver the configured kind mix:
-    `_kind_shares` applies `kind_balance` INSIDE each (label, category) cell,
-    so a kind confined to a few categories is capped at
-    `label_w * sum(q_c over the cells it occupies)` no matter what the target
-    says. On the v23 faces-only semisynthetic pool that ceiling is ~0.19
-    against a 0.25 request, and the 2026-09-08 run measured 0.0952 -- semi
-    reached ~19% of the fake half and ~9.5% of the corpus.
-
-    That cap is a data-availability fact and no sampler dial removes it. The
-    loss, however, is not capped: a scarce row can simply count for more.
-    gasbench weights the kinds equally when it scores, and
-    `calibrate.class_balance_weights` ALREADY reweights the eval to a flat
-    prior -- so until now training optimised a 0.50/0.40/0.095 prior while
-    both selection and the scorer read a flat one. This closes that mismatch
-    in the only place that is free.
-
-    Normalised to mean 1, so the loss scale -- and therefore the LR schedule
-    -- is unchanged on a batch that is already balanced.
-    """
-    w = torch.ones(y3.shape[0], dtype=torch.float32, device=y3.device)
-    for c in range(n_classes):
-        m = y3 == c
-        n_c = int(m.sum())
-        if n_c:
-            w[m] = 1.0 / n_c
-    return w * (w.numel() / w.sum().clamp_min(1e-12))
-
-
-def weighted_ce(logits: torch.Tensor, target: torch.Tensor,
-                w: torch.Tensor | None = None,
-                label_smoothing: float = 0.0) -> torch.Tensor:
-    """CE with optional per-row weights. At w=None this is F.cross_entropy."""
-    if w is None:
-        return F.cross_entropy(logits, target, label_smoothing=label_smoothing)
-    per = F.cross_entropy(logits, target, label_smoothing=label_smoothing,
-                          reduction="none")
-    return (per * w).sum() / w.sum().clamp_min(1e-12)
+    return ((p - y.float()) ** 2).mean()
 
 
 @torch.no_grad()
@@ -418,20 +367,6 @@ def main() -> None:
         persistent_workers=False,
         worker_init_fn=worker_init_fn)
 
-    # Deployment semisynthetic share of the FAKE half, used to reweight the
-    # multiclass selection metric away from the sampler's ~0.5 P(semi|fake).
-    # Derived exactly as export.py does -- the per-dataset registry share --
-    # so selection and export rank checkpoints by the same number.
-    type_prior = tr.get("type_prior")
-    if type_prior is None:
-        _fake_ds = df[df.label == 1].drop_duplicates("dataset")
-        type_prior = (float((_fake_ds["kind"] == "semisynthetic").mean())
-                      if len(_fake_ds) else 0.19)
-    type_prior = float(type_prior)
-    if acc.is_main_process and tr.get("multiclass_selection"):
-        print(f"[{spec.name}] selection = MULTICLASS sn34 "
-              f"(Gorodkin + mc Brier), type_prior={type_prior:.4f}")
-
     evals = {}
     # `data.eval_max_rows` fixes a stratified subsample of each val split
     # ONCE, here; every eval from then on reads exactly those rows, so a
@@ -530,33 +465,22 @@ def main() -> None:
                 # and this term becomes dropout-consistency (R-Drop) -- the
                 # experiment writeup needs its size, not an assumption of 0.
                 kl = symmetric_kl(za, zb)
-                # Per-row kind weights: real / synthetic / semisynthetic each
-                # carry equal total mass, matching how gasbench scores and how
-                # calibrate.class_balance_weights already weights the eval.
-                # None => byte-identical to the previous unweighted path, so
-                # kind_class_weights: false reproduces earlier runs exactly.
-                kw = kind_weights(y3) if lo.get("kind_class_weights") else None
-                loss = (weighted_ce(collapse_binary(za), y, kw, ls)
-                        + weighted_ce(collapse_binary(zb), y, kw, ls)
+                loss = (F.cross_entropy(collapse_binary(za), y, label_smoothing=ls)
+                        + F.cross_entropy(collapse_binary(zb), y, label_smoothing=ls)
                         + lo["kl_consistency"] * kl)
                 lam = lo["type_weight"]
                 fake = y3 > 0
                 if lam > 0 and bool(fake.any()):
                     ls_t = lo["type_label_smoothing"]
-                    # The type term sees ONLY fake rows, so `kw` (a corpus-wide
-                    # 3-kind balance) is the wrong weighting here -- it needs
-                    # its own 2-class balance over the fake half, where
-                    # semisynthetic is ~19% and plain CE lets synthetic
-                    # dominate the one term that separates the two.
-                    tw = (kind_weights(y3[fake] - 1, n_classes=2)
-                          if kw is not None else None)
                     loss = loss + lam * 0.5 * (
-                        weighted_ce(za[fake][:, 1:], y3[fake] - 1, tw, ls_t)
-                        + weighted_ce(zb[fake][:, 1:], y3[fake] - 1, tw, ls_t))
+                        F.cross_entropy(za[fake][:, 1:], y3[fake] - 1,
+                                        label_smoothing=ls_t)
+                        + F.cross_entropy(zb[fake][:, 1:], y3[fake] - 1,
+                                          label_smoothing=ls_t))
                 r0, r1 = lo["brier_ramp"]
                 ramp = min(1.0, max(0.0, (progress - r0) / max(1e-9, r1 - r0)))
                 loss = loss + lo["brier"] * ramp * 0.5 * (
-                    brier_loss(za, y, kw) + brier_loss(zb, y, kw))
+                    brier_loss(za, y) + brier_loss(zb, y))
                 acc.backward(loss)
                 if step == 0:
                     # Gradient checkpointing silently drops gradients when the
@@ -652,10 +576,8 @@ def main() -> None:
                     res = {k: collect_margins(model, ld, acc)
                            for k, (sub, ld) in evals.items()}
                 if acc.is_main_process:
-                    sel = evaluate_and_report(
-                        res, evals, spec.name, step, tr.get("selection"),
-                        semi_prior=type_prior,
-                        multiclass=bool(tr.get("multiclass_selection")))
+                    sel = evaluate_and_report(res, evals, spec.name, step,
+                                              tr.get("selection"))
                     if sel > best_sel:
                         best_sel = sel
                         m = acc.unwrap_model(model)
@@ -683,57 +605,11 @@ def main() -> None:
               f"-> {out/'best.pt'}")
 
 
-def multiclass_blended_sn34(r: dict, ra: dict | None, T: float,
-                            semi_prior: float,
-                            aug_weight: float = 0.2) -> float | None:
-    """Deployment-weighted 3-class sn34, blended 0.8 base / 0.2 robust.
-
-    The scorer is 3-class (Gorodkin MCC + multiclass Brier). A checkpoint
-    picked on the binary collapse is therefore picked on the wrong quantity:
-    `compose_3class` makes the collapse invariant to q by construction, so the
-    entire synthetic-vs-semisynthetic axis -- the axis this pipeline actually
-    loses on -- is INVISIBLE to the binary score. Two checkpoints with equal
-    binary sn34 and opposite typing behaviour are indistinguishable to it.
-
-    Mirrors export.py's composition exactly (same fit_type_posterior, same
-    deployment-share weights), so selection and export rank checkpoints the
-    same way instead of disagreeing silently.
-
-    Returns None when the split cannot support the fit (fewer than 3 kinds
-    present), which leaves the caller on the binary path.
-    """
-    if "y3" not in r or "d2" not in r:
-        return None
-    y3 = r["y3"]
-    if len(set(y3.tolist())) < 3:
-        return None
-    pf = 1.0 / (1.0 + np.exp(-r["d"] / T))
-    tp = fit_type_posterior(y3, r["d2"], pf, semi_prior=semi_prior)
-    w3 = y3_class_weights(y3, semi_prior)
-    T2, B2, qlo, qhi = (tp["type_temperature"], tp["type_bias"],
-                        tp["q_min"], tp["q_max"])
-
-    def _mc(rr: dict) -> float:
-        # y3/w3 come from the DEPLOY frame on purpose: the robust loader is
-        # the same rows in the same order (see build_eval_loader call site).
-        p = 1.0 / (1.0 + np.exp(-rr["d"] / T))
-        q = np.clip(1.0 / (1.0 + np.exp(-(rr["d2"] / T2 + B2))), qlo, qhi)
-        return multiclass_metrics(y3, compose_3class(p, q), w3)["mc_sn34"]
-
-    base = _mc(r)
-    if ra is None:
-        return base
-    return (1.0 - aug_weight) * base + aug_weight * _mc(ra)
-
-
 def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
-                        weights: dict | None = None,
-                        semi_prior: float = 0.19,
-                        multiclass: bool = False) -> float:
+                        weights: dict | None = None) -> float:
     """Blended sn34 per split; selection is a weighted mix of split scores."""
     print(f"  [eval] step {step}")
-    print(f"    {'split':22s}{'n':>8}{'acc':>8}{'sn34':>8}{'type':>8}"
-          f"{'mc_sn34':>9}")
+    print(f"    {'split':22s}{'n':>8}{'acc':>8}{'sn34':>8}{'type':>8}")
     for key, r in res.items():
         acc_v = float(((r["d"] > 0).astype(int) == r["y"]).mean())
         # Diagnostic only, never selection: syn-vs-semi accuracy of the raw
@@ -749,21 +625,14 @@ def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
             # Single-label canary split (val_stress is real-only): MCC/sn34
             # are undefined and a temperature fit is degenerate -- accuracy
             # here is the false-positive rate complement, which is the point.
-            print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{'--':>8}"
-                  f"{tstr:>8}{'--':>9}")
+            print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{'--':>8}{tstr:>8}")
             continue
         wts = class_balance_weights(r["y"])
         cal = fit_temperature(r["y"], r["d"])
         m = sn34_from_probs(r["y"],
                             1 / (1 + np.exp(-r["d"] / cal["temperature"])),
                             wts)
-        # The scored quantity, reported next to the binary one so the two can
-        # be watched diverging. `type` above is raw-margin accuracy at
-        # threshold 0; this is the calibrated 3-class sn34 the chain computes.
-        mc = multiclass_blended_sn34(r, None, cal["temperature"], semi_prior)
-        mstr = "--" if mc is None else f"{mc:.4f}"
-        print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{m['sn34']:>8.4f}"
-              f"{tstr:>8}{mstr:>9}")
+        print(f"    {key:22s}{len(r['y']):>8,}{acc_v:>8.4f}{m['sn34']:>8.4f}{tstr:>8}")
     # -- selection -----------------------------------------------------------
     # Which split should choose the checkpoint depends on what the model is
     # being built for, and the two goals disagree:
@@ -799,15 +668,6 @@ def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
             parts["val_id"] = 0.8 * base["sn34"] + 0.2 * aug["sn34"]
         else:
             parts["val_id"] = base["sn34"]
-        # The chain scores 3-class. Selecting on the binary collapse cannot
-        # see the syn-vs-semi axis at all (compose_3class makes the collapse
-        # invariant to q), so best.pt was being chosen on a quantity that is
-        # blind to the class this pipeline loses on. Falls back to the binary
-        # value when the split lacks all three kinds.
-        if multiclass:
-            mc = multiclass_blended_sn34(r, ra, T, semi_prior)
-            if mc is not None:
-                parts["val_id"] = mc
 
     if "val_xgen:deploy" in res:
         sub = evals["val_xgen:deploy"][0]

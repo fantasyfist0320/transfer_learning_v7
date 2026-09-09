@@ -262,6 +262,20 @@ training:
   # profile in the experiment run; baseline gets one per epoch + final).
   # An integer means every N optimizer steps, as before.
   eval_every: epoch
+  # Score checkpoints with the 3-class metric the chain actually uses
+  # (Gorodkin MCC + multiclass Brier) instead of the binary collapse.
+  #
+  # calibrate.compose_3class makes the binary collapse invariant to q, so the
+  # binary sn34 is BLIND to synthetic-vs-semisynthetic by construction -- two
+  # checkpoints with identical binary scores and opposite typing behaviour
+  # look the same to it. Semisynthetic is where this pipeline's chain gap
+  # lives, so selecting on the collapse was selecting on the wrong number.
+  # Falls back to the binary value on any split lacking all three kinds.
+  multiclass_selection: true
+  # P(semisynthetic | fake) at deployment, used to reweight the multiclass
+  # metric away from the sampler's ~0.5. null => derive it the way export.py
+  # does, from the per-dataset registry share, so selection and export agree.
+  type_prior: null
   # Checkpoint-selection mix. The ship split folds ~170 of the 183 benchmark
   # datasets into train, so the public score is mostly an IN-DISTRIBUTION
   # measurement and val_id predicts it far better than val_xgen: at step 1000
@@ -291,3 +305,17 @@ loss:
   # init + post-hoc (T2, b2) fit handle the operating point.
   type_weight: 0.3
   type_label_smoothing: 0.0
+  # Give real / synthetic / semisynthetic equal total mass in the loss.
+  #
+  # The sampler CANNOT deliver the kind mix kind_balance asks for: it applies
+  # the target inside each (label, category) cell, so semisynthetic -- which
+  # lives only in `faces` on this registry -- is capped near 0.19 against a
+  # 0.25 request and realized 0.0952 on the 2026-09-08 run. Meanwhile gasbench
+  # scores the kinds evenly and calibrate.class_balance_weights already
+  # reweights the EVAL to a flat prior, so training was fitting a
+  # 0.50/0.40/0.095 prior and being graded on a flat one.
+  #
+  # This reweights rows instead of resampling them, which is the one lever the
+  # category-coverage cap does not bound. false reproduces earlier runs byte
+  # for byte.
+  kind_class_weights: true

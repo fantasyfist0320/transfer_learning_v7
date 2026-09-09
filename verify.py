@@ -142,9 +142,30 @@ def _sampler():
         assert not r["replay_cap_bound"], (
             f"water-fill replay cap BOUND on the {tag} config -- the "
             f"P(fake|category)=0.5 identity no longer holds; rebalance.")
+
+    # The [0.05, 0.30] band above is wide enough to pass a share that misses
+    # its target 2.6x, which is exactly what shipped on 2026-09-08 (0.25 asked,
+    # 0.0952 delivered, printed "[balanced]"). Assert the IDENTITY instead:
+    # _kind_shares is cell-local, so when every cell holding semis also holds
+    # synthetics the realized share is exactly
+    #     ceiling * kb_semi / (kb_semi + kb_syn),   ceiling = label_w * sum(q_c)
+    # This catches a real regression in the share logic without demanding a
+    # global target the registry's category geometry cannot supply.
+    tgt_semi = r1["kind_target"]["semisynthetic"]
+    ceil_semi = r1["kind_ceiling"]["semisynthetic"]
+    pred_semi = ceil_semi * kb["semisynthetic"] / (kb["semisynthetic"]
+                                                   + kb["synthetic"])
+    assert abs(p_semi - pred_semi) < 1e-6, (
+        f"P(semisynthetic)={p_semi:.4f} != the cell-local prediction "
+        f"{pred_semi:.4f} (ceiling {ceil_semi:.4f} x cell split). "
+        f"_kind_shares no longer behaves as its docstring describes.")
+    unreachable = tgt_semi > ceil_semi + 1e-9
     return (f"P(fake)=0.5 and per-category 0.5 with and without kind level; "
-            f"semisynthetic x{lift:.2f}, P(semi)={p_semi:.3f}, peak replay "
-            f"{amp_semi:.1f}x < {max_replay / 2:.1f}, cap unbound")
+            f"semisynthetic x{lift:.2f}, P(semi)={p_semi:.3f} "
+            f"(target {tgt_semi:.3f}, ceiling {ceil_semi:.3f}"
+            f"{' -- UNREACHABLE, corrected in the loss by '
+               'kind_class_weights' if unreachable else ''}), "
+            f"peak replay {amp_semi:.1f}x < {max_replay / 2:.1f}, cap unbound")
 
 
 @check("transformers version matches gasbench's pin")
