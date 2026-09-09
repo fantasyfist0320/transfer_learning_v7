@@ -257,56 +257,53 @@ data:
   # persistent_workers=False on the train loader (train.py) -- with
   # persistent workers, per-epoch state never reaches the workers at all.
   degradation_schedule:
-    # TWO profiles: [laundered, deploy-faithful]. Length 2 because the finale
-    # only lands last when `epochs % len == 0`, and 2 is the ONLY length that
-    # holds for every even budget the plateau probe can return (2, 4, 6, 8).
-    # A 4-profile version failed at epochs 2 -- profiles 2 and 3 would never
-    # execute and the run would end mid-schedule. At realistic budgets only
-    # 2-3 profiles carry meaningful LR mass anyway (at epochs 4 a 4th profile
-    # gets 2.8%), so more profiles express coverage the run cannot absorb.
-    # Coverage lives in the MARGINAL, which is what arm E trains on.
+    # FOUR entries, TWO recipes, ordered MILD, MILD, LAUNDERED, LAUNDERED.
     #
-    # LR-weighted split (cosine over `total`, warmup 5%):
-    #   epochs 2 -> 80.1 / 19.9    epochs 4 -> 60.7 / 39.4
-    #   epochs 6 -> 65.6 / 34.4    epochs 8 -> 60.7 / 39.4
+    # The duplication is deliberate and is the whole mechanism. Cosine decay
+    # makes epoch order into epoch weight, so with a 2-entry alternating
+    # schedule the second-heaviest epoch (35% of the learning) always landed on
+    # the harsh profile. Repeating each recipe twice back-loads degradation:
+    # at ~12000 steps epochs 0+1 carry 73.6% of the learning on MILD and
+    # epochs 2+3 carry 26.4% on LAUNDERED.
     #
-    # CAUTION -- the time-average is NOT what a scheduled run trains on. The
-    # cosine weights early epochs far more, so the LR-weighted marginal drifts
-    # from the mean below (at epochs 2, double_jpeg_p reads 0.2503 against a
-    # 0.125 mean). Arm E measures the MEAN; a scheduled ship run trains on the
-    # LR-weighted mixture. The gap shrinks as epochs grow.
+    # Duplicating both entries leaves the TIME-AVERAGE identical -- (2*mild +
+    # 2*hard)/4 == (mild + hard)/2 -- so the base above is still the exact
+    # marginal and the measured step budget stays comparable. Only the
+    # LR-weighted mixture moves, which is the point. (Contrast the inherited
+    # 10-entry schedule, whose profiles 0 and 7 were duplicates by accident and
+    # bought nothing.)
     #
-    # Severity note (PSNR vs the scored render, 16 real images): the double
-    # arm's apparent 24.9 dB is ~99% the 1-7px crop that misaligns the DCT
-    # lattice, NOT compression -- with the shift disabled it measures 41.7 dB,
-    # milder than WebP (40.8) and resample jitter (42.6). So double-JPEG is a
-    # TRANSLATION augmentation carrying a scarce lattice signature, not the
-    # harshest op, and it does not erase high-frequency evidence (the run_3
-    # risk). It leads at epoch 0 because that signature is the scarcest thing
-    # in the recipe and epoch 0 carries the most learning -- not because it is
-    # the most damaging.
+    # Why MILD first: the laundered profile's 0.475x source jitter COMPOUNDS
+    # with the robustness chain's own 0.5x downscale on view_b -- a quarter-
+    # resolution round trip, measured 32.0 dB vs mild's 35.2 dB. That is the
+    # evidence localized (semisynthetic) manipulations live in, and the run_3
+    # failure in this repo's history was heavy aug erasing exactly it.
     #
-    # robust_skip_webp_p is NEVER 0.0 here: data.py's robustness_view short-
-    # circuits on `skip_webp_p > 0 and rng.random() < ...`, so 0.0 consumes
-    # ZERO rng draws while any positive value consumes one. A per-epoch swap
-    # between the two shifts the shared per-row stream -- exactly what
-    # build_view forbids for the enable flags, but unguarded on this key.
+    # NOTE degradation is never absent: view_b is the robustness chain on 100%
+    # of samples in EVERY epoch (50% of CE mass), and no profile can disable it
+    # -- build_view rejects schedule overrides of the enable flags, and view_b
+    # is a base `data.` key. These profiles modulate the source stage and the
+    # view_a arm mix only.
     #
-    # epoch 0 (and every even epoch) -- MILD / deploy-faithful.
-    # Ordered weak-first deliberately: the cosine puts the most learning on the
-    # earliest epochs, and the harsher profile's source jitter (0.475x) COMPOUNDS
-    # with the robustness chain's own 0.5x downscale on view_b -- roughly a
-    # quarter-resolution round trip. That is exactly the evidence localized
-    # (semisynthetic) manipulations live in, and the run_3 failure in this
-    # repo's history was heavy aug erasing it. Mild goes where the LR is high.
+    # epoch 0 -- MILD
     - laundering: {prechain_jpeg_p: 0.45, prechain_jpeg_q: [67, 97],
                    prechain_webp_q: [72, 98],
                    double_jpeg_p: 0.05, robust_skip_webp_p: 0.15}
       resample_jitter: {p: 0.30, factor_range: [0.75, 1.0]}
       view_arms: {deploy: 0.75, ladder: 0.125, robust: 0.125}
-    # epoch 1 (and every odd epoch) -- LAUNDERED: re-shared lattice, harsher
-    # codecs, heavier resize. Measured view_b 32.0 dB vs the mild profile's
-    # 35.2 dB (JPEG q55 is ~36 dB for scale).
+    # epoch 1 -- MILD (same recipe; the repeat is the LR-weighting lever)
+    - laundering: {prechain_jpeg_p: 0.45, prechain_jpeg_q: [67, 97],
+                   prechain_webp_q: [72, 98],
+                   double_jpeg_p: 0.05, robust_skip_webp_p: 0.15}
+      resample_jitter: {p: 0.30, factor_range: [0.75, 1.0]}
+      view_arms: {deploy: 0.75, ladder: 0.125, robust: 0.125}
+    # epoch 2 -- LAUNDERED: re-shared lattice, harsher codecs, heavier resize
+    - laundering: {prechain_jpeg_p: 0.20, prechain_jpeg_q: [45, 85],
+                   prechain_webp_q: [48, 92],
+                   double_jpeg_p: 0.20, robust_skip_webp_p: 0.10}
+      resample_jitter: {p: 0.575, factor_range: [0.475, 1.0]}
+      view_arms: {deploy: 0.65, ladder: 0.20, robust: 0.15}
+    # epoch 3 -- LAUNDERED (repeat)
     - laundering: {prechain_jpeg_p: 0.20, prechain_jpeg_q: [45, 85],
                    prechain_webp_q: [48, 92],
                    double_jpeg_p: 0.20, robust_skip_webp_p: 0.10}
