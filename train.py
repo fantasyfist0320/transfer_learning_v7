@@ -104,7 +104,14 @@ def build_view(d: dict, overrides: dict | None = None,
     rj = dict(d.get("resample_jitter") or {})
     la = dict(d.get("laundering") or {})
     ov = overrides or {}
-    unknown = set(ov) - {"laundering", "resample_jitter", "view_arms"}
+    # `view_b` IS schedulable, unlike the enable flags below. The view_b draws
+    # are the LAST rng consumers in __getitem__ -- deploy consumes none, robust
+    # consumes some, and nothing reads the stream afterwards -- so switching it
+    # per epoch leaves prechain / jitter / flips / arm-selection byte-identical.
+    # That is what makes a genuine clean epoch possible: it is the only way to
+    # lift clean CE mass above ~50%, since view_b is the robustness chain on
+    # 100% of samples and carries half the loss.
+    unknown = set(ov) - {"laundering", "resample_jitter", "view_arms", "view_b"}
     if unknown:
         raise SystemExit(f"{tag}: unknown override sections {sorted(unknown)}")
     if "enabled" in (ov.get("resample_jitter") or {}):
@@ -140,7 +147,7 @@ def build_view(d: dict, overrides: dict | None = None,
             # dataloader worker mid-run; fail here instead.
             raise SystemExit(f"{tag}: ladder_level_probs must sum to 1.0, "
                              f"got {sum(lp):.4f}")
-    view_b = d.get("view_b", "robust")
+    view_b = ov.get("view_b", d.get("view_b", "robust"))
     if view_b not in ("robust", "deploy"):
         # Loud, because the failure mode of a typo here is an arm that LOOKS
         # like the no-degradation treatment but still trains a robust view_b.
@@ -431,6 +438,13 @@ def main() -> None:
     if acc.is_main_process and tr.get("multiclass_selection"):
         print(f"[{spec.name}] selection = MULTICLASS sn34 "
               f"(Gorodkin + mc Brier), type_prior={type_prior:.4f}")
+    if acc.is_main_process:
+        # Loss-shaping flags are otherwise invisible: nothing downstream prints
+        # them, so a run's log could not be used to tell whether they were on.
+        print(f"[{spec.name}] loss: type_weight={lo['type_weight']} "
+              f"kind_class_weights={bool(lo.get('kind_class_weights'))} "
+              f"kl={lo['kl_consistency']} brier={lo['brier']} "
+              f"label_smoothing={lo['label_smoothing']}")
 
     evals = {}
     # `data.eval_max_rows` fixes a stratified subsample of each val split
@@ -504,7 +518,11 @@ def main() -> None:
                   f"{epoch % len(sched)}: jpeg_p={ev.prechain_jpeg_p} "
                   f"q={ev.prechain_jpeg_q} double_p={ev.prechain_double_p} "
                   f"jitter_p={ev.resample_jitter_p} rng={ev.resample_jitter_range} "
-                  f"arms=({ev.arm_deploy},{ev.arm_ladder},{ev.arm_robust})",
+                  f"arms=({ev.arm_deploy},{ev.arm_ladder},{ev.arm_robust}) "
+                  # view_b is half the CE mass and now varies per epoch, so it
+                  # has to be in the log -- a clean epoch that silently kept a
+                  # robust view_b would look identical to a real one here.
+                  f"view_b={ev.view_b_mode}",
                   flush=True)
         run_acc, run_n = 0.0, 0
         for batch in train_loader:
