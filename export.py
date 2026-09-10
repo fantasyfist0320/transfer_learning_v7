@@ -343,11 +343,22 @@ def main() -> None:
     # like a 2-logit head, binary path unaffected either way.
     T2, B2, QMIN, QMAX = 1.0, -3.0, 1e-3, 1e-3
     type_fitted = False
+    # --override-temperature replaces the T0 FIT, not the calibration PASS.
+    # The conditional syn-vs-semi posterior is independent of the binary
+    # temperature, and skipping it leaves q_min == q_max == 1e-3 -- q PINNED --
+    # so p_semi = p_fake * 1e-3 and the argmax can never reach index 2. The
+    # export then scores semisynthetic 0.00% on any multiclass run. Measured
+    # on the 2026-09-10 dinov3_384 export: local multiclass sn34 0.7593 with q
+    # pinned vs 0.9618 fitted. Both fits consume the SAME margin pass, so
+    # collect once and select per fit.
+    fit_T0 = (args.override_temperature is None
+              and not args.no_refit_temperature)
+    fit_type = not (args.binary_equivalent or args.no_refit_temperature)
     if args.override_temperature is not None:
         T = float(args.override_temperature)
         print(f"[export] T0={T:.4f} (OVERRIDE -- mixture fit from "
-              f"measure_margins.py; local fit skipped, hinge k=0)")
-    elif not args.no_refit_temperature:
+              f"measure_margins.py; local T0 fit skipped, hinge k=0)")
+    if fit_T0 or fit_type:
         df = pd.read_parquet(args.manifest)
         view = ViewConfig(image_size=image_size)
         calib_splits = [s.strip() for s in args.calib_splits.split(",")
@@ -360,7 +371,9 @@ def main() -> None:
         # The tee'd log must prove what the fit saw: a val_stress that holds
         # a zero-shot judgment set must never silently enter the calibration.
         print(f"[export] calibration fit splits: {','.join(calib_splits)} "
-              f"(n={len(sub):,})")
+              f"(n={len(sub):,}) -- fitting"
+              f"{' T0' if fit_T0 else ''}"
+              f"{' type-posterior' if fit_type else ''}")
         if args.calib_limit and len(sub) > args.calib_limit:
             sub = sub.sample(n=args.calib_limit, random_state=34) \
                      .reset_index(drop=True)
@@ -371,23 +384,29 @@ def main() -> None:
         fw = np.asarray(weights)
         d_dep = (D_dep * fw).sum(axis=1)
         d_rob = (D_rob * fw).sum(axis=1)
-        cal = fit_temperature(y, d_dep, d_rob)
-        T = float(cal["temperature"])
-        s_dep = np.sqrt(((D_dep - d_dep[:, None]) ** 2 * fw).sum(axis=1))
-        s_rob = np.sqrt(((D_rob - d_rob[:, None]) ** 2 * fw).sum(axis=1))
-        PIVOT = float(max(np.quantile(s_dep, 0.99), np.quantile(s_rob, 0.99)))
-        K = 0.0 if args.no_spread else float(args.spread_slope)
-        n_above = int((s_dep > PIVOT).sum() + (s_rob > PIVOT).sum())
-        print(f"[export] T0={T:.4f} (brier {cal['brier_before']:.4f} -> "
-              f"{cal['brier_after']:.4f} on n={len(sub):,}); hinge k={K:.2f} "
-              f"pivot={PIVOT:.2f} (local spread p50={np.median(s_dep):.2f} "
-              f"p99={np.quantile(s_dep, 0.99):.2f}; {n_above}/{2*len(sub)} "
-              f"local views above pivot)")
+        if fit_T0:
+            cal = fit_temperature(y, d_dep, d_rob)
+            T = float(cal["temperature"])
+            s_dep = np.sqrt(((D_dep - d_dep[:, None]) ** 2 * fw).sum(axis=1))
+            s_rob = np.sqrt(((D_rob - d_rob[:, None]) ** 2 * fw).sum(axis=1))
+            PIVOT = float(max(np.quantile(s_dep, 0.99),
+                              np.quantile(s_rob, 0.99)))
+            K = 0.0 if args.no_spread else float(args.spread_slope)
+            n_above = int((s_dep > PIVOT).sum() + (s_rob > PIVOT).sum())
+            print(f"[export] T0={T:.4f} (brier {cal['brier_before']:.4f} -> "
+                  f"{cal['brier_after']:.4f} on n={len(sub):,}); hinge "
+                  f"k={K:.2f} pivot={PIVOT:.2f} (local spread "
+                  f"p50={np.median(s_dep):.2f} "
+                  f"p99={np.quantile(s_dep, 0.99):.2f}; {n_above}/{2*len(sub)} "
+                  f"local views above pivot)")
 
-        if not args.binary_equivalent:
+        if fit_type:
             # Conditional posterior on the deploy view with the SCALAR T:
             # >=99% of local rows sit below the hinge pivot by construction,
-            # so t_eff == T for the fit population.
+            # so t_eff == T for the fit population. This runs on the
+            # --override-temperature path too; T here is whatever was selected
+            # above, fitted or overridden, so q is fitted against the SAME
+            # binary calibration the export actually ships.
             prior = args.type_prior
             if prior is None:
                 fake_ds = df[df.label == 1].drop_duplicates("dataset")
@@ -412,6 +431,17 @@ def main() -> None:
                       "shipping binary-equivalent (q pinned at q_min)")
     if args.binary_equivalent:
         print("[export] --binary-equivalent: q pinned at q_min, no type fit")
+    if not type_fitted and not args.binary_equivalent:
+        # Loud, because a pinned q is invisible in the binary metrics and in
+        # the round-trip check, but zeroes the semisynthetic class outright:
+        # p_semi = p_fake * q_min, so the argmax never reaches index 2 and a
+        # multiclass gasbench run reports semisynthetic 0.00%. Reaching here
+        # without --binary-equivalent means the type fit was skipped or lost
+        # to the pinned baseline -- never ship it by accident.
+        print("[export] WARNING: q is PINNED (type posterior not fitted). "
+              "This export is binary-equivalent and WILL score semisynthetic "
+              "0% on a multiclass run. Expected only with "
+              "--binary-equivalent or --no-refit-temperature.")
 
     with torch.no_grad():
         ens.temperature.fill_(T)
