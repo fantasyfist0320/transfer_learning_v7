@@ -479,6 +479,16 @@ class ViewConfig:
     # deterministic INTER_LINEAR aliasing signature that is learnable signal
     # (run_3 failure family). EXPECTED_OUTCOMES.md defines the adopt criteria.
     resample_jitter_kernels: tuple[str, ...] = ("area_linear",)
+    # Extra source-stage degradation families, applied BEFORE the view split
+    # so both views inherit them. Off by default (p=0) -- every existing arm
+    # stays byte-identical. The menu is deliberately outside the gasbench
+    # ladder: motion blur, defocus, film grain and halftone are real capture
+    # and print/scan artifacts that the ladder's DeeperForensics set
+    # (saturation / contrast / gaussian noise / gaussian blur, and only ever
+    # at its two mildest steps) does not reach.
+    effects_p: float = 0.0
+    effects: tuple[str, ...] = ()
+    effects_strength: tuple[float, float] = (0.25, 1.0)
     # Fraction of rng-driven robustness views rendered with webp_quality=None
     # -- gasbench's own JPEG-only chain. The eval path (rng=None) never skips.
     robust_skip_webp_p: float = 0.0
@@ -642,6 +652,120 @@ def source_resample_jitter(img: Image.Image, rng: random.Random,
     return Image.fromarray(cv2.resize(small, (w, h), interpolation=up))
 
 
+_DOT_TILE: dict[int, np.ndarray] = {}
+
+
+def _dot_mask(h: int, w: int, k: int) -> np.ndarray:
+    """Tiled circular dot mask for the halftone effect, cached per cell size.
+
+    Built from one k x k tile and np.tile'd out, not from a full-image mgrid:
+    the tile is reused across every call at that cell size, which keeps this
+    cheap enough to sit in a CPU-bound dataloader.
+    """
+    tile = _DOT_TILE.get(k)
+    if tile is None:
+        cy, cx = np.mgrid[0:k, 0:k]
+        d = np.sqrt((cy - (k - 1) / 2.0) ** 2 + (cx - (k - 1) / 2.0) ** 2)
+        tile = (d <= k * 0.45)
+        _DOT_TILE[k] = tile
+    reps = (h // k + 1, w // k + 1)
+    return np.tile(tile, reps)[:h, :w]
+
+
+def source_effects(img: Image.Image, rng: random.Random,
+                   cfg: ViewConfig) -> Image.Image:
+    """Capture/print artifact families the gasbench ladder cannot produce.
+
+    Applied at the SOURCE stage, so both views inherit the effect -- the same
+    placement as the codec prechain and the resample jitter, and the reason it
+    reaches 100% of the CE mass rather than the ladder arm's ~8%.
+
+    Why this exists. The ladder's only non-geometric families are
+    DeeperForensics CS / CC / GNC / GB, and `ApplyDeeperForensicsDistortion`
+    draws its level from randint(0, 2) where level 0 is a passthrough and
+    get_distortion_parameter indexes level-1 -- so only the two MILDEST of
+    five steps are ever reachable (blur kernel 7 or 9, noise sigma 0.001 or
+    0.002), on ~2% of CE mass. Directional motion blur, film grain and
+    halftone have no entry in that table at all.
+
+    Stream contract: exactly FOUR draws are consumed on every call, whatever
+    `effects_p` or the menu contain, so changing either per epoch cannot shift
+    a row's downstream stream. That is stricter than the prechain/jitter
+    helpers, which consume a variable count.
+    """
+    import cv2
+
+    u = rng.random()            # gate
+    pick = rng.random()         # which family
+    mag = rng.random()          # strength within effects_strength
+    aux = rng.random()          # angle / secondary parameter
+    if u >= cfg.effects_p or not cfg.effects:
+        return img
+    name = cfg.effects[min(int(pick * len(cfg.effects)), len(cfg.effects) - 1)]
+    lo, hi = cfg.effects_strength
+    t = lo + mag * (hi - lo)                     # normalised strength in [lo,hi]
+    a = _to_u8_hwc(img)
+    h, w = a.shape[:2]
+    short = max(8, min(h, w))
+
+    if name == "motion_blur":
+        # Directional streak: a line kernel rotated to a random angle. Length
+        # scales with the short side so the effect is resolution-independent,
+        # but is CAPPED at 31px: filter2D is O(k^2) per pixel and an uncapped
+        # kernel on a 3000px source cost 111 ms/img against a ~31 ms/img
+        # budget for the whole dataloader at bs 64. 31px at the 384 render is
+        # still a heavy streak.
+        ln = max(3, min(31, int(round(t * 0.035 * short))) | 1)
+        ker = np.zeros((ln, ln), np.float32)
+        ker[ln // 2, :] = 1.0
+        M = cv2.getRotationMatrix2D((ln / 2 - 0.5, ln / 2 - 0.5), aux * 180.0, 1.0)
+        ker = cv2.warpAffine(ker, M, (ln, ln))
+        tot = ker.sum()
+        if tot <= 1e-6:
+            return img
+        out = cv2.filter2D(a, -1, ker / tot)
+
+    elif name == "defocus_blur":
+        # Out-of-focus capture. Reaches well past the ladder's kernel 7/9.
+        ks = max(3, min(31, int(round(t * 0.03 * short))) | 1)
+        out = cv2.GaussianBlur(a, (ks, ks), 0)
+
+    elif name == "film_grain":
+        # Luminance-correlated grain plus a slight desaturation -- the scanned
+        # -film look, unlike GNC's per-channel iid gaussian.
+        # Noise is generated at 1/4 scale and upsampled: grain is spatially
+        # correlated anyway, and a full-resolution normal() over ~8M samples
+        # cost 525 ms/img. This is ~16x fewer samples for a closer look.
+        gh, gw = max(1, h // 4), max(1, w // 4)
+        g = np.random.default_rng(int(aux * (2**31 - 1))) \
+              .normal(0.0, t * 18.0, (gh, gw)).astype(np.float32)
+        g = cv2.resize(g, (w, h), interpolation=cv2.INTER_LINEAR)[..., None]
+        out = np.clip(a.astype(np.float32) + g, 0, 255)
+        grey = out.mean(axis=2, keepdims=True)
+        out = np.clip(out * (1.0 - 0.12 * t) + grey * (0.12 * t), 0, 255) \
+                .astype(np.uint8)
+
+    elif name == "halftone":
+        # Print/scan stipple: area-downsample to a cell grid, hold each cell
+        # flat, then keep only a circular dot per cell on a white ground.
+        k = max(2, int(round(2 + t * 0.012 * short)))
+        small = cv2.resize(a, (max(1, w // k), max(1, h // k)),
+                           interpolation=cv2.INTER_AREA)
+        blocky = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+        m = _dot_mask(h, w, k)[..., None]
+        dots = np.where(m, blocky, 255).astype(np.float32)
+        # Alpha-blend with the source rather than hard-replacing. A pure dot
+        # render on white measures 9.8 dB PSNR -- past degradation and into
+        # "different image", which would teach the branch nothing about the
+        # photograph underneath. `t` makes it a dial from faint stipple to
+        # full print screen.
+        out = np.clip(dots * t + a.astype(np.float32) * (1.0 - t), 0, 255)
+
+    else:
+        return img
+    return Image.fromarray(np.ascontiguousarray(out.astype(np.uint8)))
+
+
 def deploy_view(u8_hwc: np.ndarray, size: int, seed: int) -> np.ndarray:
     """The exact scored transform: level 0, no random crop."""
     out, _, _, _ = apply_random_augmentations(u8_hwc, (size, size), seed=seed,
@@ -800,6 +924,9 @@ class ManifestDataset(Dataset):
             img = source_prechain(img, rng, cfg)
         if cfg.resample_jitter:
             img = source_resample_jitter(img, rng, cfg)
+        # After the jitter so a blur is not undone by a downsample, and before
+        # the flips so both views share the effect exactly.
+        img = source_effects(img, rng, cfg)
         # Flips on the source region, so both views share geometry exactly.
         if rng.random() < cfg.hflip_p:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)

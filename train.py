@@ -147,6 +147,14 @@ def build_view(d: dict, overrides: dict | None = None,
             # dataloader worker mid-run; fail here instead.
             raise SystemExit(f"{tag}: ladder_level_probs must sum to 1.0, "
                              f"got {sum(lp):.4f}")
+    known_fx = {"motion_blur", "defocus_blur", "film_grain", "halftone"}
+    bad_fx = set(la.get("effects") or ()) - known_fx
+    if bad_fx:
+        # Loud: an unknown name would silently fall through source_effects'
+        # else-branch and return the image untouched, so the arm would look
+        # configured but train clean.
+        raise SystemExit(f"{tag}: unknown laundering.effects {sorted(bad_fx)}; "
+                         f"choose from {sorted(known_fx)}")
     view_b = ov.get("view_b", d.get("view_b", "robust"))
     if view_b not in ("robust", "deploy"):
         # Loud, because the failure mode of a typo here is an arm that LOOKS
@@ -169,6 +177,14 @@ def build_view(d: dict, overrides: dict | None = None,
                       resample_jitter_kernels=tuple(rj.get("kernels",
                                                            ("area_linear",))),
                       robust_skip_webp_p=la.get("robust_skip_webp_p", 0.0),
+                      # Source-stage effect families. Live under `laundering`
+                      # so the degradation schedule can vary them per epoch;
+                      # source_effects consumes a FIXED 4 draws either way, so
+                      # neither p nor the menu can shift the row's stream.
+                      effects_p=float(la.get("effects_p", 0.0)),
+                      effects=tuple(la.get("effects") or ()),
+                      effects_strength=tuple(la.get("effects_strength",
+                                                    (0.25, 1.0))),
                       ladder_crop_guard=la.get("ladder_crop_guard", True),
                       ladder_level_probs=lp,
                       arm_deploy=arms["deploy"], arm_ladder=arms["ladder"],
