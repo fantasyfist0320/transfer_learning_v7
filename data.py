@@ -488,6 +488,13 @@ class ViewConfig:
     # at its two mildest steps) does not reach.
     effects_p: float = 0.0
     effects: tuple[str, ...] = ()
+    # Per-family selection weights, parallel to `effects`. Empty => uniform.
+    # This exists so WIDTH and SEVERITY stay independent dials: `pick` indexes
+    # the menu, so adding families to a uniform menu silently DIVIDES every
+    # incumbent family's mass (4 -> 10 families cuts motion_blur from 8.75%
+    # of rows to 3.5%). Weights let new families be added on top of a
+    # validated recipe instead of diluting it.
+    effects_weights: tuple[float, ...] = ()
     effects_strength: tuple[float, float] = (0.25, 1.0)
     # Fraction of rng-driven robustness views rendered with webp_quality=None
     # -- gasbench's own JPEG-only chain. The eval path (rng=None) never skips.
@@ -672,6 +679,27 @@ def _dot_mask(h: int, w: int, k: int) -> np.ndarray:
     return np.tile(tile, reps)[:h, :w]
 
 
+_VIG_TILE: np.ndarray | None = None
+
+
+def _vignette_mask(h: int, w: int) -> np.ndarray:
+    """Normalised radial falloff in [0,1]: 0 at the centre, 1 at the corners.
+
+    Built once at 64x64 and bilinearly resized to the frame. The mask is a
+    smooth low-frequency field, so the 64px source costs nothing visible, and
+    caching per (h, w) is not an option: the pool's source resolutions are
+    essentially unbounded and such a cache would grow without limit.
+    """
+    global _VIG_TILE
+    if _VIG_TILE is None:
+        yy, xx = np.mgrid[0:64, 0:64].astype(np.float32)
+        cy = cx = 31.5
+        d = np.sqrt(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2)
+        _VIG_TILE = (np.clip(d / np.sqrt(2.0), 0.0, 1.0) ** 2).astype(np.float32)
+    import cv2
+    return cv2.resize(_VIG_TILE, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def source_effects(img: Image.Image, rng: random.Random,
                    cfg: ViewConfig) -> Image.Image:
     """Capture/print artifact families the gasbench ladder cannot produce.
@@ -701,7 +729,22 @@ def source_effects(img: Image.Image, rng: random.Random,
     aux = rng.random()          # angle / secondary parameter
     if u >= cfg.effects_p or not cfg.effects:
         return img
-    name = cfg.effects[min(int(pick * len(cfg.effects)), len(cfg.effects) - 1)]
+    wts = cfg.effects_weights
+    if wts and len(wts) == len(cfg.effects):
+        # Weighted menu, still ONE draw: walk the cumulative mass with `pick`.
+        # Keeps the four-draw contract intact while letting a config add
+        # families without rescaling the incumbents (see ViewConfig).
+        r = pick * float(sum(wts))
+        acc = 0.0
+        name = cfg.effects[-1]
+        for nm, wi in zip(cfg.effects, wts):
+            acc += float(wi)
+            if r < acc:
+                name = nm
+                break
+    else:
+        name = cfg.effects[min(int(pick * len(cfg.effects)),
+                               len(cfg.effects) - 1)]
     lo, hi = cfg.effects_strength
     t = lo + mag * (hi - lo)                     # normalised strength in [lo,hi]
     a = _to_u8_hwc(img)
@@ -760,6 +803,76 @@ def source_effects(img: Image.Image, rng: random.Random,
         # photograph underneath. `t` makes it a dial from faint stipple to
         # full print screen.
         out = np.clip(dots * t + a.astype(np.float32) * (1.0 - t), 0, 255)
+
+    elif name == "oversharpen":
+        # Unsharp halos. The INVERSE of the two blur families, and the one
+        # capture artifact the recipe had no entry for at all: consumer ISPs
+        # ship aggressively sharpened JPEGs while most generators emit smooth
+        # edges, so edge ringing is a REAL-photo cue the model never saw in
+        # training and had no reason to read as anything but anomalous.
+        r = (max(1, int(round(1 + aux * 3))) * 2) + 1      # 3,5,7,9
+        blur = cv2.GaussianBlur(a, (r, r), 0)
+        k = 1.1 * t
+        out = cv2.addWeighted(a, 1.0 + k, blur, -k, 0.0)
+
+    elif name == "sensor_noise":
+        # Signal-dependent per-channel shot noise. Distinct from film_grain
+        # (single-channel, luma-correlated, desaturating) and from the
+        # ladder's GNC (iid but frozen at sigma 0.001-0.002).
+        # Generated at 1/4 scale and upsampled NEAREST -- not for speed alone:
+        # source-resolution iid noise is almost entirely averaged away by the
+        # downscale to 384, so full-res noise would cost the most and survive
+        # the least. NEAREST (vs film_grain's LINEAR) keeps it pixel-blocky,
+        # which is what still reads as sensor noise after the render resize.
+        gh, gw = max(1, h // 4), max(1, w // 4)
+        g = np.random.default_rng(int(aux * (2**31 - 1))) \
+              .normal(0.0, 1.0, (gh, gw, 3)).astype(np.float32)
+        g = cv2.resize(g, (w, h), interpolation=cv2.INTER_NEAREST)
+        f = a.astype(np.float32)
+        # sqrt(signal) scaling: shot noise is Poisson, so highlights are
+        # noisier than shadows -- the opposite of an additive gaussian.
+        out = np.clip(f + g * (t * 11.0) * np.sqrt(np.maximum(f, 4.0) / 255.0),
+                      0, 255)
+
+    elif name == "banding":
+        # Value-space quantization: gradient banding from aggressive
+        # re-encode, screenshots and 16->8 bit tone mapping. The only family
+        # that distorts in LEVEL rather than in frequency or geometry, which
+        # is precisely why it is here -- every other entry in the menu leaves
+        # the tone curve intact.
+        q = max(10, int(round(72 - t * 60)))               # 72 -> 12 levels
+        step = 255.0 / (q - 1)
+        out = np.clip(np.round(a.astype(np.float32) / step) * step, 0, 255)
+
+    elif name == "color_cast":
+        # White-balance / tint error. Real captures carry illuminant casts
+        # (tungsten, shade, mixed lighting, aged prints); most generators emit
+        # neutrally balanced frames. `aux` picks the direction on the R/B
+        # chroma plane so the cast is not always warm.
+        ang = aux * 2.0 * np.pi
+        f = a.astype(np.float32)
+        f[..., 0] *= 1.0 + 0.19 * t * float(np.cos(ang))
+        f[..., 2] *= 1.0 + 0.19 * t * float(np.sin(ang))
+        out = np.clip(f, 0, 255)
+
+    elif name == "vignette":
+        # Lens falloff: a smooth low-frequency luminance gradient. Adds the
+        # spatial-nonuniformity axis -- every other family here is spatially
+        # stationary, so a model trained only on them has no reason to expect
+        # the same content to be darker at the frame edge.
+        m = _vignette_mask(h, w)[..., None]
+        out = np.clip(a.astype(np.float32) * (1.0 - 0.36 * t * m), 0, 255)
+
+    elif name == "chroma_shift":
+        # Lateral chromatic aberration / channel misregistration from cheap
+        # optics and from chroma-subsampled re-encodes. Geometric and
+        # PER-CHANNEL, which nothing else in the menu is; R shifts across and
+        # B down so the two are separable rather than a global translation.
+        d = max(1, min(6, int(round(t * 0.004 * short))))
+        dx = d if aux < 0.5 else -d
+        out = a.copy()
+        out[..., 0] = np.roll(a[..., 0], dx, axis=1)
+        out[..., 2] = np.roll(a[..., 2], -dx, axis=0)
 
     else:
         return img

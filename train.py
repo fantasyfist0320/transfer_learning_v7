@@ -147,8 +147,24 @@ def build_view(d: dict, overrides: dict | None = None,
             # dataloader worker mid-run; fail here instead.
             raise SystemExit(f"{tag}: ladder_level_probs must sum to 1.0, "
                              f"got {sum(lp):.4f}")
-    known_fx = {"motion_blur", "defocus_blur", "film_grain", "halftone"}
-    bad_fx = set(la.get("effects") or ()) - known_fx
+    known_fx = {"motion_blur", "defocus_blur", "film_grain", "halftone",
+                "oversharpen", "sensor_noise", "banding", "color_cast",
+                "vignette", "chroma_shift"}
+    # `effects` accepts EITHER a list (uniform weights) or a mapping
+    # {name: weight}. The mapping form exists because `pick` indexes the menu:
+    # under a uniform list, adding families divides every incumbent's mass, so
+    # a width increase is silently also a severity CUT. Weights decouple them.
+    fx_raw = la.get("effects") or ()
+    if isinstance(fx_raw, dict):
+        fx_names = tuple(str(k) for k in fx_raw)
+        fx_wts = tuple(float(v) for v in fx_raw.values())
+        if any(w <= 0.0 for w in fx_wts):
+            raise SystemExit(f"{tag}: laundering.effects weights must be > 0, "
+                             f"got {dict(zip(fx_names, fx_wts))}")
+    else:
+        fx_names = tuple(str(x) for x in fx_raw)
+        fx_wts = ()
+    bad_fx = set(fx_names) - known_fx
     if bad_fx:
         # Loud: an unknown name would silently fall through source_effects'
         # else-branch and return the image untouched, so the arm would look
@@ -182,7 +198,8 @@ def build_view(d: dict, overrides: dict | None = None,
                       # source_effects consumes a FIXED 4 draws either way, so
                       # neither p nor the menu can shift the row's stream.
                       effects_p=float(la.get("effects_p", 0.0)),
-                      effects=tuple(la.get("effects") or ()),
+                      effects=fx_names,
+                      effects_weights=fx_wts,
                       effects_strength=tuple(la.get("effects_strength",
                                                     (0.25, 1.0))),
                       ladder_crop_guard=la.get("ladder_crop_guard", True),
