@@ -34,9 +34,9 @@ from torch.utils.data import DataLoader
 from branches import BRANCHES, resolve
 from build_splits import _stable_frac
 from calibrate import (blended_sn34, class_balance_weights, compose_3class,
-                       crossfit_temperature, fit_temperature,
+                       crossfit_temperature, deploy_p_fake, fit_temperature,
                        fit_type_posterior, multiclass_metrics,
-                       sn34_from_probs, y3_class_weights)
+                       set_deploy_prior, sn34_from_probs, y3_class_weights)
 from data import (BalancedSampler, ManifestDataset, ViewConfig,
                   balanced_weights, clique_pairs, worker_init_fn)
 from model import BranchModel, binary_margin, collapse_binary, type_margin
@@ -57,7 +57,38 @@ REQUIRED = {
 OPTIONAL_DATA = ("clean_view_recompress", "resample_jitter", "laundering",
                  "selection", "gasstation_boost", "degradation_schedule",
                  "use_degradation_schedule", "view_b", "eval_max_rows",
-                 "ladder_level_probs", "multiclass_selection", "type_prior")
+                 "ladder_level_probs", "multiclass_selection", "type_prior",
+                 "objective", "deploy_prior")
+OBJECTIVES = ("factorized", "multiclass")
+
+
+def resolve_prior(tr: dict, df: pd.DataFrame) -> tuple[float, str]:
+    """(type_prior = P(semi|fake) for selection, where it came from).
+
+    `training.deploy_prior: [real, synthetic, semisynthetic]` -- the
+    score-weighted class shares of the benchmark the model will be graded on
+    (panel_check.py prior prints them from a chain run) -- also sets the
+    real/fake target of every calibrate.py weighting via set_deploy_prior.
+    Without it the old behaviour stands: a flat 50/50 real/fake target and
+    the registry's dataset-level semi share.
+    """
+    dp = tr.get("deploy_prior")
+    if dp is not None:
+        real, syn, semi = set_deploy_prior(dp)
+        derived = semi / (syn + semi)
+        if tr.get("type_prior") is not None and \
+                abs(float(tr["type_prior"]) - derived) > 1e-3:
+            raise SystemExit(
+                f"training.type_prior={tr['type_prior']} contradicts "
+                f"training.deploy_prior (semi/(syn+semi) = {derived:.4f}); "
+                f"set only one")
+        return derived, f"deploy_prior {real:.3f}/{syn:.3f}/{semi:.3f}"
+    if tr.get("type_prior") is not None:
+        return float(tr["type_prior"]), "training.type_prior"
+    fake_ds = df[df.label == 1].drop_duplicates("dataset")
+    share = (float((fake_ds["kind"] == "semisynthetic").mean())
+             if len(fake_ds) else 0.19)
+    return share, "registry dataset share (no deploy_prior set)"
 
 
 def validate_config(cfg: dict) -> None:
@@ -81,6 +112,13 @@ def validate_config(cfg: dict) -> None:
     tot = sum(float(arms[a]) for a in ("deploy", "ladder", "robust"))
     if abs(tot - 1.0) > 1e-6:
         raise SystemExit(f"view_arms must sum to 1.0, got {tot}")
+    objective = cfg["loss"].get("objective", "factorized")
+    if objective not in OBJECTIVES:
+        raise SystemExit(f"loss.objective must be one of {OBJECTIVES}, "
+                         f"got {objective!r}")
+    dp = cfg["training"].get("deploy_prior")
+    if dp is not None:
+        set_deploy_prior(dp)      # raises on a malformed prior, before training
 
 
 def build_view(d: dict, overrides: dict | None = None,
@@ -260,6 +298,21 @@ def brier_loss(z: torch.Tensor, y: torch.Tensor,
     return (se * w).sum() / w.sum().clamp_min(1e-12)
 
 
+def brier3_loss(z: torch.Tensor, y3: torch.Tensor,
+                w: torch.Tensor | None = None) -> torch.Tensor:
+    """Multiclass Brier sum_k (p_k - 1{y3=k})^2 per row, (weighted) mean.
+
+    gasbench's multiclass Brier term (baseline 2/3 = a uniform guess). Unlike
+    brier_loss, a confident 'synthetic' on a semisynthetic row costs as much
+    here as calling it real, which is how the chain scores it.
+    """
+    p = F.softmax(z.float(), -1)
+    se = ((p - F.one_hot(y3, p.shape[-1]).float()) ** 2).sum(-1)
+    if w is None:
+        return se.mean()
+    return (se * w).sum() / w.sum().clamp_min(1e-12)
+
+
 def kind_weights(y3: torch.Tensor, n_classes: int = 3) -> torch.Tensor:
     """Per-row weights giving every kind PRESENT in the batch equal total mass.
 
@@ -272,12 +325,15 @@ def kind_weights(y3: torch.Tensor, n_classes: int = 3) -> torch.Tensor:
     reached ~19% of the fake half and ~9.5% of the corpus.
 
     That cap is a data-availability fact and no sampler dial removes it. The
-    loss, however, is not capped: a scarce row can simply count for more.
-    gasbench weights the kinds equally when it scores, and
-    `calibrate.class_balance_weights` ALREADY reweights the eval to a flat
-    prior -- so until now training optimised a 0.50/0.40/0.095 prior while
-    both selection and the scorer read a flat one. This closes that mismatch
-    in the only place that is free.
+    loss, however, is not capped: a scarce row can simply count for more, so
+    the type boundary sees enough semisynthetic gradient to be learned.
+
+    CORRECTION 2026-09-13: this was first justified as "gasbench weights the
+    kinds equally". It does not -- it samples an equal cap per DATASET and
+    weights by provenance (public/holdout/gasstation), never by label; the
+    score-weighted v24 prior is ~0.43 / 0.52 / 0.06. Balanced kinds remain a
+    reasonable training choice, but matching the scorer's prior is the job of
+    `training.deploy_prior` in selection and calibration, not of this.
 
     Normalised to mean 1, so the loss scale -- and therefore the LR schedule
     -- is unchanged on a batch that is already balanced.
@@ -460,22 +516,23 @@ def main() -> None:
 
     # Deployment semisynthetic share of the FAKE half, used to reweight the
     # multiclass selection metric away from the sampler's ~0.5 P(semi|fake).
-    # Derived exactly as export.py does -- the per-dataset registry share --
-    # so selection and export rank checkpoints by the same number.
-    type_prior = tr.get("type_prior")
-    if type_prior is None:
-        _fake_ds = df[df.label == 1].drop_duplicates("dataset")
-        type_prior = (float((_fake_ds["kind"] == "semisynthetic").mean())
-                      if len(_fake_ds) else 0.19)
-    type_prior = float(type_prior)
+    # export.py resolves the same number from the same inputs (--deploy-prior
+    # or its registry fallback), so selection and export rank checkpoints alike.
+    type_prior, prior_src = resolve_prior(tr, df)
+    objective = lo.get("objective", "factorized")
+    if acc.is_main_process:
+        print(f"[{spec.name}] prior: P(fake)={deploy_p_fake():.4f} "
+              f"type_prior={type_prior:.4f} ({prior_src})")
     if acc.is_main_process and tr.get("multiclass_selection"):
         print(f"[{spec.name}] selection = MULTICLASS sn34 "
               f"(Gorodkin + mc Brier), type_prior={type_prior:.4f}")
     if acc.is_main_process:
         # Loss-shaping flags are otherwise invisible: nothing downstream prints
         # them, so a run's log could not be used to tell whether they were on.
-        print(f"[{spec.name}] loss: type_weight={lo['type_weight']} "
-              f"kind_class_weights={bool(lo.get('kind_class_weights'))} "
+        print(f"[{spec.name}] loss: objective={objective} "
+              + (f"type_weight={lo['type_weight']} " if objective == "factorized"
+                 else "(type_weight unused) ")
+              + f"kind_class_weights={bool(lo.get('kind_class_weights'))} "
               f"kl={lo['kl_consistency']} brier={lo['brier']} "
               f"label_smoothing={lo['label_smoothing']}")
 
@@ -582,32 +639,53 @@ def main() -> None:
                 # experiment writeup needs its size, not an assumption of 0.
                 kl = symmetric_kl(za, zb)
                 # Per-row kind weights: real / synthetic / semisynthetic each
-                # carry equal total mass, matching how gasbench scores and how
-                # calibrate.class_balance_weights already weights the eval.
+                # carry equal total mass in the batch -- a representation-
+                # learning balance for the scarce semi class, NOT a match to
+                # the scorer's prior (see kind_weights).
                 # None => byte-identical to the previous unweighted path, so
                 # kind_class_weights: false reproduces earlier runs exactly.
                 kw = kind_weights(y3) if lo.get("kind_class_weights") else None
-                loss = (weighted_ce(collapse_binary(za), y, kw, ls)
-                        + weighted_ce(collapse_binary(zb), y, kw, ls)
-                        + lo["kl_consistency"] * kl)
-                lam = lo["type_weight"]
-                fake = y3 > 0
-                if lam > 0 and bool(fake.any()):
-                    ls_t = lo["type_label_smoothing"]
-                    # The type term sees ONLY fake rows, so `kw` (a corpus-wide
-                    # 3-kind balance) is the wrong weighting here -- it needs
-                    # its own 2-class balance over the fake half, where
-                    # semisynthetic is ~19% and plain CE lets synthetic
-                    # dominate the one term that separates the two.
-                    tw = (kind_weights(y3[fake] - 1, n_classes=2)
-                          if kw is not None else None)
-                    loss = loss + lam * 0.5 * (
-                        weighted_ce(za[fake][:, 1:], y3[fake] - 1, tw, ls_t)
-                        + weighted_ce(zb[fake][:, 1:], y3[fake] - 1, tw, ls_t))
-                r0, r1 = lo["brier_ramp"]
-                ramp = min(1.0, max(0.0, (progress - r0) / max(1e-9, r1 - r0)))
-                loss = loss + lo["brier"] * ramp * 0.5 * (
-                    brier_loss(za, y, kw) + brier_loss(zb, y, kw))
+                if objective == "multiclass":
+                    # Direct 3-class objective (2026-09-13): CE and Brier on
+                    # the full probability vector the scorer reads, so the
+                    # synthetic-vs-semisynthetic split is inside BOTH terms --
+                    # the factorized Brier below scores only 1 - p_real and is
+                    # blind to it. type_weight is unused: CE_3 already contains
+                    # the conditional type CE (CE_3 = CE_bin(collapse) + CE_cond
+                    # on fake rows). label_smoothing here is 3-class, i.e. ls/3
+                    # target mass on the semi logit of every row; set it to 0
+                    # to rule that out. export.py needs no change: its
+                    # [1-p, p(1-q), pq] composition of logsumexp margins IS
+                    # softmax(z) at identity calibration.
+                    loss = (weighted_ce(za, y3, kw, ls)
+                            + weighted_ce(zb, y3, kw, ls)
+                            + lo["kl_consistency"] * kl)
+                    r0, r1 = lo["brier_ramp"]
+                    ramp = min(1.0, max(0.0, (progress - r0) / max(1e-9, r1 - r0)))
+                    loss = loss + lo["brier"] * ramp * 0.5 * (
+                        brier3_loss(za, y3, kw) + brier3_loss(zb, y3, kw))
+                else:
+                    loss = (weighted_ce(collapse_binary(za), y, kw, ls)
+                            + weighted_ce(collapse_binary(zb), y, kw, ls)
+                            + lo["kl_consistency"] * kl)
+                    lam = lo["type_weight"]
+                    fake = y3 > 0
+                    if lam > 0 and bool(fake.any()):
+                        ls_t = lo["type_label_smoothing"]
+                        # The type term sees ONLY fake rows, so `kw` (a corpus-wide
+                        # 3-kind balance) is the wrong weighting here -- it needs
+                        # its own 2-class balance over the fake half, where
+                        # semisynthetic is ~19% and plain CE lets synthetic
+                        # dominate the one term that separates the two.
+                        tw = (kind_weights(y3[fake] - 1, n_classes=2)
+                              if kw is not None else None)
+                        loss = loss + lam * 0.5 * (
+                            weighted_ce(za[fake][:, 1:], y3[fake] - 1, tw, ls_t)
+                            + weighted_ce(zb[fake][:, 1:], y3[fake] - 1, tw, ls_t))
+                    r0, r1 = lo["brier_ramp"]
+                    ramp = min(1.0, max(0.0, (progress - r0) / max(1e-9, r1 - r0)))
+                    loss = loss + lo["brier"] * ramp * 0.5 * (
+                        brier_loss(za, y, kw) + brier_loss(zb, y, kw))
                 acc.backward(loss)
                 if step == 0:
                     # Gradient checkpointing silently drops gradients when the

@@ -55,23 +55,66 @@ def sn34_from_probs(y: np.ndarray, p: np.ndarray, w: np.ndarray | None = None,
     }
 
 
-def class_balance_weights(y: np.ndarray) -> np.ndarray:
-    """Per-sample weights giving each class equal total mass.
+# ---------------------------------------------------------------------------
+# Deployment prior. One process-wide setting read by class_balance_weights and
+# y3_class_weights, so every fit and score in train.py / export.py reweights
+# to the same target without threading a parameter through a dozen call sites
+# (a missed site would silently keep 50/50).
+#
+# Unset, the target is 50/50 real/fake -- the historical behaviour, bit for
+# bit. That default rested on a wrong premise: gasbench samples an equal cap
+# per DATASET (so the prior follows registry counts, ~115 real vs ~97 fake
+# entries) and weights by provenance (public 0.50 / holdout 0.35 / gasstation
+# 0.15), never by label. The score-weighted prior moves with each benchmark's
+# hidden holdouts: v24 is ~0.425 / 0.517 / 0.057 (P(semi|fake) 0.10), while
+# v23 had P(semi|fake) ~0.23. `panel_check.py prior` prints it from a chain run.
+# ---------------------------------------------------------------------------
 
-    Both MCC and Brier depend on the class prior, and the benchmark's prior is
-    near 0.5: `calculate_weighted_dataset_sampling` draws a roughly equal cap
-    from each of ~89 real and ~91 synthetic datasets. A validation split rarely
-    matches that -- with the current holdout lists val_id lands near P(fake)=0.64
-    and val_xgen near 0.33 -- so fitting a temperature on the split's raw prior
-    calibrates for a distribution that will not be deployed against. Reweighting
-    to 50/50 removes that mismatch without touching the model.
+_DEPLOY_PRIOR: tuple[float, float, float] | None = None
+
+
+def set_deploy_prior(prior) -> tuple[float, float, float]:
+    """Set [real, synthetic, semisynthetic] shares (renormalised); None resets."""
+    global _DEPLOY_PRIOR
+    if prior is None:
+        _DEPLOY_PRIOR = None
+        return (0.5, 0.25, 0.25)
+    vals = [float(v) for v in prior]
+    if len(vals) != 3 or min(vals) < 0 or vals[0] <= 0 or vals[1] + vals[2] <= 0:
+        raise ValueError(f"deploy_prior wants [real, synthetic, semisynthetic] "
+                         f"non-negative shares with real>0 and a fake class>0, "
+                         f"got {prior!r}")
+    tot = sum(vals)
+    if abs(tot - 1.0) > 0.02:
+        raise ValueError(f"deploy_prior shares sum to {tot:.4f}, expected ~1")
+    _DEPLOY_PRIOR = tuple(v / tot for v in vals)
+    return _DEPLOY_PRIOR
+
+
+def deploy_p_fake() -> float:
+    """P(not real) the calibration weights target: 0.5 unless a prior is set."""
+    return 0.5 if _DEPLOY_PRIOR is None else 1.0 - _DEPLOY_PRIOR[0]
+
+
+def class_balance_weights(y: np.ndarray) -> np.ndarray:
+    """Per-sample weights rebalancing a pool to the deployment real/fake prior.
+
+    Both MCC and Brier depend on the class prior. A validation split rarely
+    matches deployment -- with the current holdout lists val_id lands near
+    P(fake)=0.64 and val_xgen near 0.33 -- so fitting a temperature on the
+    split's raw prior calibrates for a distribution that will not be deployed
+    against. Reweighting removes that mismatch without touching the model.
+
+    Target P(fake) = deploy_p_fake(): 0.5 unless set_deploy_prior was called
+    (see the block above for why 0.5 is only a default).
     """
     y = np.asarray(y).astype(int)
+    pf = deploy_p_fake()
     w = np.ones(len(y), dtype=float)
-    for c in (0, 1):
+    for c, tgt in ((0, 1.0 - pf), (1, pf)):
         m = y == c
         if m.any():
-            w[m] = 0.5 / m.sum()
+            w[m] = tgt / m.sum()
     return w * len(y) / max(w.sum(), 1e-12)
 
 
@@ -93,14 +136,15 @@ def compose_3class(p_fake: np.ndarray, q: np.ndarray) -> np.ndarray:
 def y3_class_weights(y3: np.ndarray, semi_prior: float) -> np.ndarray:
     """Per-sample weights rebalancing a pool to the deployment class shares.
 
-    Target: real 0.5, synthetic 0.5*(1-semi_prior), semi 0.5*semi_prior --
-    the benchmark's ~50/50 real/fake prior with the semisynthetic share of
-    the fake half. The local val pool is nowhere near this (kind_balance
-    trains/validates at P(semi|fake)~0.5), so scoring it raw would let the
-    semi class dominate every multiclass number 10x beyond deployment.
+    Target: real 1-pf, synthetic pf*(1-semi_prior), semi pf*semi_prior, with
+    pf = deploy_p_fake() (0.5 unless a deploy prior is set). The local val
+    pool is nowhere near this (kind_balance trains/validates at
+    P(semi|fake)~0.5), so scoring it raw would let the semi class dominate
+    every multiclass number far beyond deployment.
     """
     y3 = np.asarray(y3).astype(int)
-    target = {0: 0.5, 1: 0.5 * (1.0 - semi_prior), 2: 0.5 * semi_prior}
+    pf = deploy_p_fake()
+    target = {0: 1.0 - pf, 1: pf * (1.0 - semi_prior), 2: pf * semi_prior}
     w = np.ones(len(y3), dtype=float)
     for c, tgt in target.items():
         m = y3 == c

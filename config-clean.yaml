@@ -351,10 +351,12 @@ loss:
   # The sampler CANNOT deliver the kind mix kind_balance asks for: it applies
   # the target inside each (label, category) cell, so semisynthetic -- which
   # lives only in `faces` on this registry -- is capped near 0.19 against a
-  # 0.25 request and realized 0.0952 on the 2026-09-08 run. Meanwhile gasbench
-  # scores the kinds evenly and calibrate.class_balance_weights already
-  # reweights the EVAL to a flat prior, so training was fitting a
-  # 0.50/0.40/0.095 prior and being graded on a flat one.
+  # 0.25 request and realized 0.0952 on the 2026-09-08 run, so without
+  # reweighting the syn-vs-semi boundary sees little semisynthetic gradient.
+  # (CORRECTED 2026-09-13: this once said gasbench scores the kinds evenly.
+  # It does not -- it weights by provenance, never by label; v24's
+  # score-weighted prior is ~0.43/0.52/0.06. Matching THAT prior is
+  # training.deploy_prior's job, in selection and calibration.)
   #
   # This reweights rows instead of resampling them, which is the one lever the
   # category-coverage cap does not bound. false reproduces earlier runs byte

@@ -1,4 +1,35 @@
 # ============================================================
+# ARM H -- ARM F PLUS CORRECTNESS FIXES (2026-09-13).
+#
+# Arm F (config-experiment-3.yaml, on-chain SN34 0.9148 @ 15000 steps) with
+# exactly these changes and nothing else:
+#
+#   output_dir: runs/v7-mc
+#   loss.objective: multiclass        CE_3 + Brier_3 on the full probability
+#                                     vector. Arm F's Brier scored only
+#                                     1 - p_real and was blind to synthetic
+#                                     vs semisynthetic, which the chain scores.
+#   loss.brier: 0.50 -> 0.30          Brier_3 is ~2x Brier_bin on a real/fake
+#                                     error, so 0.30 keeps real/fake pressure
+#                                     near Arm F's (0.6 vs 0.5) and adds typing.
+#   training.deploy_prior             v24 score-weighted shares from
+#                                     `panel_check.py prior` on Arm F's chain
+#                                     run: replaces the 50/50 real/fake target
+#                                     and the registry semi share (0.19-0.33)
+#                                     in selection and calibration.
+#
+# Not a config change, but part of this arm: splits are rebuilt with the
+# split_unit-aligned val_id carve (build_splits.py default since 2026-09-13),
+# so both halves of a registry real/fake pair land on the same side of
+# train/val_id. Arm F was selected on the per-dataset carve, which split them.
+#
+# Unchanged on purpose: label_smoothing 0.02 (now 3-class: 0.0067 target mass
+# on the semi logit per row), kind_class_weights, sampler, schedule, lr,
+# steps. type_weight stays in the file but is unused under multiclass.
+#
+# Arm F's original header follows.
+# ============================================================
+# ============================================================
 # PLATEAU-PROBE CONFIG (dinov3 epoch-budget measurement, 2026-09-08).
 # See RUNBOOK-PLATEAU.md.
 #
@@ -47,7 +78,7 @@
 # Do NOT edit mid-run.
 # ============================================================
 seed: 34
-output_dir: runs/v7-diverse
+output_dir: runs/v7-mc
 
 # Branches to train (one `train.py --branch NAME` run each) and to fuse at
 # export. Registry lives in branches.py: dinov3 + clip carry effective fusion
@@ -405,6 +436,11 @@ training:
   # metric away from the sampler's ~0.5. null => derive it the way export.py
   # does, from the per-dataset registry share, so selection and export agree.
   type_prior: null
+  # Score-weighted [real, synthetic, semisynthetic] of benchmark v24
+  # (panel_check.py prior --chain chain_refs/armF.json). Sets type_prior
+  # (0.0999) and the calibration real/fake target (0.5748). Recompute when
+  # the benchmark version changes -- v23 was P(semi|fake) ~0.23.
+  deploy_prior: [0.4252, 0.5173, 0.0574]
   # Checkpoint-selection mix. The ship split folds ~170 of the 183 benchmark
   # datasets into train, so the public score is mostly an IN-DISTRIBUTION
   # measurement and val_id predicts it far better than val_xgen: at step 1000
@@ -423,8 +459,10 @@ loss:
   # CE(view_a) + CE(view_b) + kl*symKL + brier(ramped). Deliberately four
   # terms: the v5 teacher/MIL/supcon stack was never individually ablated and
   # BMF's production branches carry none of it.
+  # ARM H: direct 3-class CE + Brier_3 (train.py). factorized = Arm F.
+  objective: multiclass
   kl_consistency: 0.50
-  brier: 0.50
+  brier: 0.30              # Arm F 0.50 (binary Brier); see header
   brier_ramp: [0.2, 0.6]  # ramps 0->1 over this progress window
   label_smoothing: 0.02
   # Factorized 3-class terms (see train.py): binary CE on the collapsed pair

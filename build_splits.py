@@ -84,7 +84,8 @@ def _stable_frac(key: str, seed: int) -> float:
     return int.from_bytes(h, "big") / float(1 << 64)
 
 
-def block_key(sub: pd.DataFrame, target_blocks: int = 16) -> pd.Series:
+def block_key(sub: pd.DataFrame, target_blocks: int = 16,
+              size_rows: int | None = None) -> pd.Series:
     """A grouping key for near-duplicate rows within one dataset.
 
     `source_file` names the parquet shard or archive member and is the best
@@ -104,20 +105,75 @@ def block_key(sub: pd.DataFrame, target_blocks: int = 16) -> pd.Series:
     protection for coverage: at 500 images a block is ~31 consecutive frames,
     so a scene longer than that can straddle. Where `source_file` is available
     it is preferred precisely because it has no such limit.
+
+    `size_rows` sizes index blocks from a different row count than `sub`'s
+    own -- the carve passes the largest dataset of a split_unit so index i
+    falls in the same block in every dataset of that unit.
     """
     if sub["source_file"].nunique() >= 8:
         return sub["source_file"].astype(str)
     idx = sub["file_index"]
     if (idx < 0).mean() > 0.5:      # unparseable filenames: fall back to position
         idx = pd.Series(range(len(sub)), index=sub.index)
-    size = max(8, len(sub) // max(1, target_blocks))
+    size = max(8, (size_rows if size_rows is not None else len(sub))
+               // max(1, target_blocks))
     return (idx.clip(lower=0) // size).astype(str)
+
+
+def _carve_keys(train: pd.DataFrame) -> pd.Series:
+    """Block key per train row for the val_id carve.
+
+    A key names rows that must land on the same side of train/val_id.
+    Datasets unioned into one split_unit (real/fake pairs, shards of one
+    release, cliques) key their blocks by the UNIT, not the dataset, so row i
+    of pair-real and row i of pair-fake share a key when they share a
+    source_file or an index block; index blocks use one block size per unit
+    (sized from its largest dataset) for the same reason. A unit of one keeps
+    the exact `dataset|block` key, so datasets without relatives split
+    byte-identically to the old per-dataset carve.
+
+    This aligns relatives only when their shards or file order actually
+    correspond; pairs stored in unrelated orders stay as unprotected as
+    before, and nothing in the cache metadata can fix that.
+    """
+    unit_size = train.groupby("split_unit")["dataset"].nunique()
+    largest = train.groupby(["split_unit", "dataset"]).size().groupby(level=0).max()
+    key = pd.Series(index=train.index, dtype=object)
+    for name, sub in train.groupby("dataset", sort=False):
+        unit = sub["split_unit"].iloc[0]
+        if unit_size[unit] > 1:
+            key[sub.index] = unit + "|" + block_key(sub, size_rows=int(largest[unit]))
+        else:
+            key[sub.index] = name + "|" + block_key(sub)
+    return key
+
+
+def carve_val_id(df: pd.DataFrame, seed: int, val_id_frac: float) -> list:
+    """Row indices for val_id: ~val_id_frac of every split_unit, by key."""
+    train = df[df["split"] == "train"]
+    key = _carve_keys(train)
+    chosen: list = []
+    for _, keys in key.groupby(train["split_unit"], sort=False):
+        counts = keys.value_counts()
+        if len(counts) < 2:
+            continue          # one key means all-or-nothing; take nothing
+        order = sorted(counts.index, key=lambda k: _stable_frac(k, seed))
+        target = max(1, int(round(int(counts.sum()) * val_id_frac)))
+        taken, picked = 0, []
+        for k in order:
+            if taken >= target:
+                break
+            picked.append(k)
+            taken += int(counts[k])
+        chosen.extend(keys.index[keys.isin(picked)].tolist())
+    return chosen
 
 
 def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
                   val_id_frac: float = 0.06,
                   per_dataset_cap: int | None = None,
-                  strict_provenance: bool = False) -> pd.DataFrame:
+                  strict_provenance: bool = False,
+                  legacy_val_id_carve: bool = False) -> pd.DataFrame:
     df = df.copy()
     cliques = list(overrides.get("pair_groups") or [])
     if strict_provenance:
@@ -188,29 +244,39 @@ def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
 
     df["split"] = df["split_unit"].map(designated).fillna("train")
 
-    # Carve val_id out of train, by block, WITHIN each dataset.
+    # Carve val_id out of train, by block, WITHIN each split_unit.
     #
-    # Per-dataset rather than a global hash threshold: val_id's job is to be an
+    # Per-unit rather than a global hash threshold: val_id's job is to be an
     # in-distribution estimate of the training mix, for early stopping and for
     # fitting the temperature. A global threshold over blocks makes coverage a
     # lottery -- with ~2 blocks per dataset it selected 22 of 136 datasets and
     # skewed P(fake) from 0.57 to 0.64. Taking roughly val_id_frac of every
-    # dataset guarantees the split actually looks like train.
+    # unit keeps the split looking like train.
+    #
+    # Per-unit rather than per-dataset (2026-09-13): the per-dataset carve
+    # hashed `dataset|block` independently for each dataset, so row i of a
+    # real/fake pair landed on opposite sides of train/val_id (reproduced: 32
+    # of 64 pairs). val_id then scored near-copies of training images and
+    # flattered selection and the fitted temperature. `legacy_val_id_carve`
+    # restores the old carve to rebuild a historical split.
     is_train = df["split"] == "train"
-    val_id_idx: list = []
-    for name, sub in df[is_train].groupby("dataset", sort=False):
-        bk = block_key(sub)
-        blocks = sorted(bk.unique(), key=lambda b: _stable_frac(f"{name}|{b}", seed))
-        if len(blocks) < 2:
-            continue          # one block means all-or-nothing; take nothing
-        target = max(1, int(round(len(sub) * val_id_frac)))
-        chosen, taken = [], 0
-        for b in blocks:
-            if taken >= target:
-                break
-            chosen.append(b)
-            taken += int((bk == b).sum())
-        val_id_idx.extend(sub.index[bk.isin(chosen)].tolist())
+    if legacy_val_id_carve:
+        val_id_idx: list = []
+        for name, sub in df[is_train].groupby("dataset", sort=False):
+            bk = block_key(sub)
+            blocks = sorted(bk.unique(), key=lambda b: _stable_frac(f"{name}|{b}", seed))
+            if len(blocks) < 2:
+                continue          # one block means all-or-nothing; take nothing
+            target = max(1, int(round(len(sub) * val_id_frac)))
+            chosen, taken = [], 0
+            for b in blocks:
+                if taken >= target:
+                    break
+                chosen.append(b)
+                taken += int((bk == b).sum())
+            val_id_idx.extend(sub.index[bk.isin(chosen)].tolist())
+    else:
+        val_id_idx = carve_val_id(df, seed, val_id_frac)
     df.loc[val_id_idx, "split"] = "val_id"
 
     # Optional per-dataset cap on train. The benchmark draws a roughly equal
@@ -244,7 +310,7 @@ def validate(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Returns (errors, warnings). Errors invalidate every downstream number."""
     errors, warnings = [], []
 
-    fam = df["split"].map(SPLIT_FAMILY).fillna(df["split"])
+    fam =df["split"].map(SPLIT_FAMILY).fillna(df["split"])
     spans = fam.groupby(df["split_unit"]).nunique()
     bad = spans[spans > 1]
     if len(bad):
@@ -363,6 +429,10 @@ def main() -> None:
                     help="also union distribution_groups (generator trained on "
                          "a real corpus, no per-image derivation). Conservative; "
                          "costs training datasets.")
+    ap.add_argument("--legacy-val-id-carve", action="store_true",
+                    help="carve val_id per dataset as before 2026-09-13 (lets "
+                         "the two halves of a real/fake pair straddle "
+                         "train/val_id). Only to rebuild a historical split.")
     ap.add_argument("--write", action="store_true",
                     help="without this the split is computed and reported only")
     args = ap.parse_args()
@@ -372,7 +442,8 @@ def main() -> None:
     df = assign_splits(df, overrides, seed=args.seed,
                        val_id_frac=args.val_id_frac,
                        per_dataset_cap=args.per_dataset_cap,
-                       strict_provenance=args.strict_provenance)
+                       strict_provenance=args.strict_provenance,
+                       legacy_val_id_carve=args.legacy_val_id_carve)
     report(df)
 
     errors, warnings = validate(df)

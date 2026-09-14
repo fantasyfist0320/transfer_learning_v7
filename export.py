@@ -38,7 +38,8 @@ import torch
 import yaml
 
 from branches import resolve, fusion_weights
-from calibrate import fit_temperature, fit_type_posterior
+from calibrate import (deploy_p_fake, fit_temperature, fit_type_posterior,
+                       set_deploy_prior)
 from data import ManifestDataset, ViewConfig, worker_init_fn
 from model import BranchModel, binary_margin, type_margin
 from allowlist import render_template, scan_allowlist
@@ -220,6 +221,14 @@ def main() -> None:
                          "semisynthetic share of the manifest's fake "
                          "DATASETS (dataset-level, matching the benchmark's "
                          "fixed per-dataset sampling), ~0.05.")
+    ap.add_argument("--deploy-prior", default=None, metavar="REAL,SYN,SEMI",
+                    help="score-weighted class shares of the benchmark this "
+                         "export will be graded on (panel_check.py prior "
+                         "prints them), e.g. 0.425,0.517,0.057 for v24. Sets "
+                         "the real/fake target of the T0 fit and "
+                         "P(semi|fake) of the type fit. Default: the "
+                         "checkpoint config's training.deploy_prior, else "
+                         "50/50 and the registry share.")
     ap.add_argument("--binary-equivalent", action="store_true",
                     help="pin q at q_min (no type fit): the 3-logit export "
                          "whose multiclass score equals a 2-logit head's "
@@ -358,6 +367,25 @@ def main() -> None:
         T = float(args.override_temperature)
         print(f"[export] T0={T:.4f} (OVERRIDE -- mixture fit from "
               f"measure_margins.py; local T0 fit skipped, hinge k=0)")
+    # Deployment prior for every calibration weighting below. Precedence:
+    # --deploy-prior, then the training config's training.deploy_prior (so
+    # export targets the prior checkpoint selection used), else the old
+    # 50/50 + registry-share defaults. See calibrate.set_deploy_prior.
+    if args.deploy_prior:
+        dp, dp_src = args.deploy_prior.split(","), "--deploy-prior"
+    else:
+        dp = ((cfg0 or {}).get("training") or {}).get("deploy_prior")
+        dp_src = ("checkpoint config training.deploy_prior" if dp is not None
+                  else "none: 50/50 real/fake, registry semi share")
+    if dp is not None:
+        _, syn, semi = set_deploy_prior(dp)
+        derived = semi / (syn + semi)
+        if args.type_prior is not None and abs(args.type_prior - derived) > 1e-3:
+            raise SystemExit(f"--type-prior {args.type_prior} contradicts the "
+                             f"deploy prior's semi/(syn+semi) = {derived:.4f} "
+                             f"({dp_src}); pass one or the other")
+        args.type_prior = derived
+    print(f"[export] deploy prior: P(fake)={deploy_p_fake():.4f} ({dp_src})")
     if fit_T0 or fit_type:
         df = pd.read_parquet(args.manifest)
         view = ViewConfig(image_size=image_size)
