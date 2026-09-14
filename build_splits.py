@@ -197,6 +197,7 @@ def carve_val_cal(df: pd.DataFrame, seed: int, val_cal_frac: float,
 def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
                   val_id_frac: float = 0.06,
                   per_dataset_cap: int | None = None,
+                  cap_exempt: tuple[str, ...] = ("gasstation",),
                   strict_provenance: bool = False,
                   legacy_val_id_carve: bool = False,
                   val_cal_frac: float = 0.0) -> pd.DataFrame:
@@ -320,10 +321,14 @@ def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
     # number of samples from every dataset (calculate_weighted_dataset_sampling
     # gives each regular dataset the same cap, gasstation 5x), so a constant
     # per-dataset cap is what makes train's dataset marginal match eval's.
+    # gasstation is exempt by default: it is one logical dataset built from every
+    # downloaded week (~20k rows), carries the highest per-sample score weight, and
+    # the sampler already scales its exposure (sampler.gasstation_boost), so a flat
+    # cap would throw away generator/week coverage the boost then over-replays.
     if per_dataset_cap:
         keep = []
         for name, sub in df[df["split"] == "train"].groupby("dataset", sort=False):
-            if len(sub) <= per_dataset_cap:
+            if len(sub) <= per_dataset_cap or any(e in name for e in cap_exempt):
                 keep.extend(sub.index.tolist())
                 continue
             fr = sub["image_id"].map(lambda k: _stable_frac(k, seed))
@@ -474,7 +479,12 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="defaults to overwriting --manifest")
     ap.add_argument("--seed", type=int, default=34)
     ap.add_argument("--val-id-frac", type=float, default=0.06)
-    ap.add_argument("--per-dataset-cap", type=int, default=None)
+    ap.add_argument("--per-dataset-cap", type=int, default=None,
+                    help="cap TRAIN rows per dataset (applied after the val_id carve; "
+                         "surplus rows become split 'unused')")
+    ap.add_argument("--cap-exempt", nargs="*", default=["gasstation"],
+                    help="dataset-name substrings never capped (default: gasstation). "
+                         "Pass --cap-exempt with no names to cap everything.")
     ap.add_argument("--strict-provenance", action="store_true",
                     help="also union distribution_groups (generator trained on "
                          "a real corpus, no per-image derivation). Conservative; "
@@ -497,6 +507,7 @@ def main() -> None:
     df = assign_splits(df, overrides, seed=args.seed,
                        val_id_frac=args.val_id_frac,
                        per_dataset_cap=args.per_dataset_cap,
+                       cap_exempt=tuple(args.cap_exempt),
                        strict_provenance=args.strict_provenance,
                        legacy_val_id_carve=args.legacy_val_id_carve,
                        val_cal_frac=args.val_cal_frac)
