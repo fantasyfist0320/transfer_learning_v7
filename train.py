@@ -38,7 +38,8 @@ from calibrate import (blended_sn34, class_balance_weights, compose_3class,
                        fit_type_posterior, multiclass_metrics,
                        set_deploy_prior, sn34_from_probs, y3_class_weights)
 from data import (BalancedSampler, ManifestDataset, ViewConfig,
-                  balanced_weights, clique_pairs, worker_init_fn)
+                  balanced_weights, clique_pairs, realized_stream_report,
+                  worker_init_fn)
 from model import BranchModel, binary_margin, collapse_binary, type_margin
 
 REQUIRED = {
@@ -502,6 +503,9 @@ def main() -> None:
                               rank=acc.process_index,
                               world_size=acc.num_processes, pairs=pairs,
                               pair_frac=cfg["sampler"]["clique_pair_frac"])
+    if acc.is_main_process:
+        realized_stream_report(tr_df, w, rep, pairs,
+                               cfg["sampler"]["clique_pair_frac"], cfg["seed"])
     train_ds = ManifestDataset(tr_df, view, train=True, seed=cfg["seed"])
     train_loader = DataLoader(
         train_ds, batch_size=tr["batch_size"], sampler=sampler,
@@ -615,6 +619,7 @@ def main() -> None:
                   f"view_b={ev.view_b_mode}",
                   flush=True)
         run_acc, run_n = 0.0, 0
+        run_acc3, run_semi_hit, run_semi_n = 0.0, 0.0, 0
         for batch in train_loader:
             if step >= total:
                 break
@@ -766,15 +771,29 @@ def main() -> None:
             # is not distorted by how the fake mass splits across classes.
             run_acc += ((binary_margin(za) > 0).long() == y).float().sum().item()
             run_n += len(y)
+            # 3-class view of the same batches: `acc` alone can climb while
+            # semisynthetic is being called synthetic. Raw argmax on view_a,
+            # uncalibrated and at the sampler's kind mix -- a trend line, not
+            # the scored number.
+            pred3 = za.argmax(dim=1)
+            run_acc3 += (pred3 == y3).float().sum().item()
+            semi = y3 == 2
+            run_semi_hit += (pred3[semi] == 2).float().sum().item()
+            run_semi_n += int(semi.sum().item())
             step += 1
 
             if step % 50 == 0 and acc.is_main_process:
+                semi_str = (f"{run_semi_hit/run_semi_n:.4f}" if run_semi_n
+                            else "--")
                 print(f"[{spec.name}] ep{epoch} step {step}/{total} "
                       f"loss={loss.item():.4f} kl={kl.item():.4f} "
                       f"acc={run_acc/max(1,run_n):.4f} "
+                      f"acc3={run_acc3/max(1,run_n):.4f} "
+                      f"semi_recall={semi_str} "
                       f"lr={lr:.2e} {(time.time()-t0)/step:.2f}s/step",
                       flush=True)
                 run_acc, run_n = 0.0, 0
+                run_acc3, run_semi_hit, run_semi_n = 0.0, 0.0, 0
 
             if step % eval_interval == 0 or step == total:
                 with ema.swapped_in():
@@ -855,6 +874,21 @@ def multiclass_blended_sn34(r: dict, ra: dict | None, T: float,
     return (1.0 - aug_weight) * base + aug_weight * _mc(ra)
 
 
+def _t_fit_weights(r: dict, multiclass: bool, semi_prior: float):
+    """Weights for the binary temperature fit.
+
+    Under multiclass selection the type posterior is fitted at the deployment
+    real/synthetic/semisynthetic shares, so T is fitted at the SAME shares --
+    otherwise T targets the val pool's own fake-half mix (kind_balance
+    trains near P(semi|fake)~0.5) while q targets semi_prior. Binary path
+    (or a split lacking a kind): None, i.e. fit_temperature's real/fake
+    balance, exactly as before.
+    """
+    if not multiclass or "y3" not in r or len(set(r["y3"].tolist())) < 3:
+        return None
+    return y3_class_weights(r["y3"], semi_prior)
+
+
 def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
                         weights: dict | None = None,
                         semi_prior: float = 0.19,
@@ -882,7 +916,8 @@ def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
                   f"{tstr:>8}{'--':>9}")
             continue
         wts = class_balance_weights(r["y"])
-        cal = fit_temperature(r["y"], r["d"])
+        cal = fit_temperature(r["y"], r["d"],
+                              w=_t_fit_weights(r, multiclass, semi_prior))
         m = sn34_from_probs(r["y"],
                             1 / (1 + np.exp(-r["d"] / cal["temperature"])),
                             wts)
@@ -920,7 +955,8 @@ def evaluate_and_report(res: dict, evals: dict, name: str, step: int,
         ra = res.get("val_id:robust")
         w_id = class_balance_weights(r["y"])
         cal = fit_temperature(r["y"], r["d"],
-                              ra["d"] if ra is not None else None)
+                              ra["d"] if ra is not None else None,
+                              w=_t_fit_weights(r, multiclass, semi_prior))
         T = cal["temperature"]
         base = sn34_from_probs(r["y"], 1 / (1 + np.exp(-r["d"] / T)), w_id)
         if ra is not None:

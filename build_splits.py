@@ -148,17 +148,16 @@ def _carve_keys(train: pd.DataFrame) -> pd.Series:
     return key
 
 
-def carve_val_id(df: pd.DataFrame, seed: int, val_id_frac: float) -> list:
-    """Row indices for val_id: ~val_id_frac of every split_unit, by key."""
-    train = df[df["split"] == "train"]
-    key = _carve_keys(train)
+def _pick_by_key(key: pd.Series, unit: pd.Series, seed: int, frac: float,
+                 salt: str = "") -> list:
+    """Row indices covering ~frac of every unit's rows, whole keys at a time."""
     chosen: list = []
-    for _, keys in key.groupby(train["split_unit"], sort=False):
+    for _, keys in key.groupby(unit, sort=False):
         counts = keys.value_counts()
         if len(counts) < 2:
             continue          # one key means all-or-nothing; take nothing
-        order = sorted(counts.index, key=lambda k: _stable_frac(k, seed))
-        target = max(1, int(round(int(counts.sum()) * val_id_frac)))
+        order = sorted(counts.index, key=lambda k: _stable_frac(k + salt, seed))
+        target = max(1, int(round(int(counts.sum()) * frac)))
         taken, picked = 0, []
         for k in order:
             if taken >= target:
@@ -169,11 +168,38 @@ def carve_val_id(df: pd.DataFrame, seed: int, val_id_frac: float) -> list:
     return chosen
 
 
+def carve_val_id(df: pd.DataFrame, seed: int, val_id_frac: float,
+                 key: pd.Series) -> list:
+    """Row indices for val_id: ~val_id_frac of every split_unit, by key.
+    The unsalted key string is the hash input, as in the per-dataset carve."""
+    train = df[df["split"] == "train"]
+    return _pick_by_key(key[train.index], train["split_unit"], seed, val_id_frac)
+
+
+def carve_val_cal(df: pd.DataFrame, seed: int, val_cal_frac: float,
+                  key: pd.Series) -> list:
+    """Row indices moved from val_id to val_cal: ~val_cal_frac of each unit's
+    val_id rows, under a different hash salt so the choice is independent of
+    which blocks became val_id.
+
+    `key` must be the keys computed on the FULL train pool before the val_id
+    carve. Recomputing them on the val_id subset is wrong: a dataset with few
+    val_id rows falls below block_key's source_file threshold and switches to
+    index blocks, so its keys stop matching its pair's (measured: 6 of 576
+    paired blocks split across val_id/val_cal)."""
+    val = df[df["split"] == "val_id"]
+    if val.empty:
+        return []
+    return _pick_by_key(key[val.index], val["split_unit"], seed, val_cal_frac,
+                        salt="|val_cal")
+
+
 def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
                   val_id_frac: float = 0.06,
                   per_dataset_cap: int | None = None,
                   strict_provenance: bool = False,
-                  legacy_val_id_carve: bool = False) -> pd.DataFrame:
+                  legacy_val_id_carve: bool = False,
+                  val_cal_frac: float = 0.0) -> pd.DataFrame:
     df = df.copy()
     cliques = list(overrides.get("pair_groups") or [])
     if strict_provenance:
@@ -260,6 +286,8 @@ def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
     # flattered selection and the fitted temperature. `legacy_val_id_carve`
     # restores the old carve to rebuild a historical split.
     is_train = df["split"] == "train"
+    # Keys on the whole pre-carve train pool; val_cal below reuses them.
+    carve_key = _carve_keys(df[is_train])
     if legacy_val_id_carve:
         val_id_idx: list = []
         for name, sub in df[is_train].groupby("dataset", sort=False):
@@ -276,8 +304,17 @@ def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
                 taken += int((bk == b).sum())
             val_id_idx.extend(sub.index[bk.isin(chosen)].tolist())
     else:
-        val_id_idx = carve_val_id(df, seed, val_id_frac)
+        val_id_idx = carve_val_id(df, seed, val_id_frac, carve_key)
     df.loc[val_id_idx, "split"] = "val_id"
+
+    # Optional val_cal: a disjoint slice of the carve that checkpoint
+    # selection never reads (train.py evaluates val_id/val_xgen/val_stress
+    # only) and export.py calibrates on by default. Without it the same
+    # val_id rows pick the checkpoint AND fit T0/T2/b2/q_max, which flatters
+    # both. Carved from val_id with the same unit-aligned keys, so a pair
+    # still lands on one side; train is untouched.
+    if val_cal_frac > 0:
+        df.loc[carve_val_cal(df, seed, val_cal_frac, carve_key), "split"] = "val_cal"
 
     # Optional per-dataset cap on train. The benchmark draws a roughly equal
     # number of samples from every dataset (calculate_weighted_dataset_sampling
@@ -301,7 +338,8 @@ def assign_splits(df: pd.DataFrame, overrides: dict, *, seed: int = 34,
 # sources on purpose -- it is the in-distribution estimate used for early
 # stopping and temperature fitting, and both want the train distribution. What
 # must never be shared is a source between the train side and a held-out side.
-SPLIT_FAMILY = {"train": "train", "val_id": "train", "unused": "train",
+SPLIT_FAMILY = {"train": "train", "val_id": "train", "val_cal": "train",
+                "unused": "train",
                 "val_xgen": "val_xgen", "val_stress": "val_stress",
                 "test": "test"}
 
@@ -310,7 +348,18 @@ def validate(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Returns (errors, warnings). Errors invalidate every downstream number."""
     errors, warnings = [], []
 
-    fam =df["split"].map(SPLIT_FAMILY).fillna(df["split"])
+    cal = df[df.split == "val_cal"]
+    if not cal.empty:
+        kinds = set(cal["kind"]) if "kind" in cal.columns else set()
+        if cal.label.nunique() < 2:
+            errors.append("split 'val_cal' has only one label")
+        elif kinds and "semisynthetic" not in kinds:
+            warnings.append(
+                "split 'val_cal' has no semisynthetic rows: export's type "
+                "posterior cannot be fitted on it (q ships pinned). Raise "
+                "--val-cal-frac or calibrate with --calib-splits val_id.")
+
+    fam = df["split"].map(SPLIT_FAMILY).fillna(df["split"])
     spans = fam.groupby(df["split_unit"]).nunique()
     bad = spans[spans > 1]
     if len(bad):
@@ -391,7 +440,8 @@ def validate(df: pd.DataFrame) -> tuple[list[str], list[str]]:
 def report(df: pd.DataFrame) -> None:
     print(f"\n{'split':12}{'images':>10}{'datasets':>10}{'P(fake)':>10}"
           f"{'categories':>12}")
-    for s in ("train", "val_id", "val_xgen", "val_stress", "test", "unused"):
+    for s in ("train", "val_id", "val_cal", "val_xgen", "val_stress", "test",
+              "unused"):
         sub = df[df.split == s]
         if sub.empty:
             continue
@@ -433,6 +483,11 @@ def main() -> None:
                     help="carve val_id per dataset as before 2026-09-13 (lets "
                          "the two halves of a real/fake pair straddle "
                          "train/val_id). Only to rebuild a historical split.")
+    ap.add_argument("--val-cal-frac", type=float, default=0.0,
+                    help="move this fraction of val_id (by unit-aligned "
+                         "blocks) to val_cal: rows checkpoint selection never "
+                         "scores, which export.py calibrates on by default. "
+                         "0 (default) = no val_cal, historical behaviour.")
     ap.add_argument("--write", action="store_true",
                     help="without this the split is computed and reported only")
     args = ap.parse_args()
@@ -443,7 +498,8 @@ def main() -> None:
                        val_id_frac=args.val_id_frac,
                        per_dataset_cap=args.per_dataset_cap,
                        strict_provenance=args.strict_provenance,
-                       legacy_val_id_carve=args.legacy_val_id_carve)
+                       legacy_val_id_carve=args.legacy_val_id_carve,
+                       val_cal_frac=args.val_cal_frac)
     report(df)
 
     errors, warnings = validate(df)

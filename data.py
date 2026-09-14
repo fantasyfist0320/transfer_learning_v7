@@ -443,6 +443,64 @@ class BalancedSampler(Sampler[int]):
         return iter(idx[self.rank::self.world_size].tolist())
 
 
+def realized_stream_report(df: pd.DataFrame, weights: np.ndarray, report: dict,
+                           pairs: dict, pair_frac: float, seed: int,
+                           epoch: int = 0, verbose: bool = True) -> dict:
+    """Exposure of the stream the loader ACTUALLY draws, clique pairs included.
+
+    `balanced_weights`' report describes the multinomial weights. The sampler
+    then overwrites `pair_frac` of the stream with clique pairs drawn uniformly
+    over mixed-label split_units and uniformly within each side, which moves
+    dataset, kind and per-image replay away from that report (a small clique
+    member gets far more than its weight). This replays one epoch's global
+    index stream -- indices only, no images -- and reports what it contains.
+    """
+    s = BalancedSampler(weights, num_samples=len(df), seed=seed, pairs=pairs,
+                        pair_frac=pair_frac)
+    s.set_epoch(epoch)
+    idx = np.fromiter(iter(s), dtype=np.int64)
+    n = len(df)
+    lab = df["label"].to_numpy()[idx]
+    counts = np.bincount(idx, minlength=n)
+    out = {
+        "p_fake": float(lab.mean()),
+        "p_kind": ({k: float((df["kind"].astype(str).to_numpy()[idx] == k).mean())
+                    for k in KINDS} if "kind" in df.columns else {}),
+        "max_row_draws": int(counts.max()),
+        "distinct_frac": float((counts > 0).mean()),
+        "pair_slots": 2 * (int(len(idx) * s.pair_frac) // 2),
+    }
+    ds = pd.Series(df["dataset"].astype(str).to_numpy()[idx]).value_counts(normalize=True)
+    planned = (pd.Series(weights, index=df["dataset"].astype(str).to_numpy())
+               .groupby(level=0).sum())
+    shift = ds.reindex(planned.index, fill_value=0.0) - planned
+    out["top_mass"] = [(k, float(v), float(planned.get(k, 0.0)))
+                       for k, v in ds.head(5).items()]
+    out["largest_shift"] = [(k, float(ds.get(k, 0.0)), float(planned[k]))
+                            for k in shift.abs().sort_values(ascending=False).head(3).index]
+    if verbose:
+        kinds = "  ".join(f"{k}={v:.4f}(plan {report['p_kind'].get(k, 0.0):.4f})"
+                          for k, v in out["p_kind"].items() if v > 0)
+        print(f"[sampler:stream] epoch {epoch} as drawn ({out['pair_slots']:,} "
+              f"of {len(idx):,} slots are clique pairs): P(fake)="
+              f"{out['p_fake']:.4f}(plan {report['p_fake']:.4f})  {kinds}")
+        print(f"[sampler:stream] max draws of one image {out['max_row_draws']} "
+              f"(highest planned expectation {report['amp_max']:.1f}x)  distinct images "
+              f"{out['distinct_frac']:.1%}")
+        print("[sampler:stream] top dataset mass: " + "  ".join(
+            f"{k}={v:.3%}(plan {p:.3%})" for k, v, p in out["top_mass"]))
+        print("[sampler:stream] largest shift from plan: " + "  ".join(
+            f"{k} {p:.3%}->{v:.3%}" for k, v, p in out["largest_shift"]))
+        off = [k for k, v in out["p_kind"].items()
+               if abs(v - report["p_kind"].get(k, 0.0)) > KIND_TOL]
+        if off or abs(out["p_fake"] - report["p_fake"]) > KIND_TOL:
+            print(f"[sampler:stream] WARNING realized stream misses the "
+                  f"planned shares by more than {KIND_TOL} "
+                  f"({', '.join(off) or 'P(fake)'}); the [sampler] lines above "
+                  f"describe the weights, not what trains.")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------

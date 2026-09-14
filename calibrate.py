@@ -178,7 +178,8 @@ def multiclass_metrics(y3: np.ndarray, P: np.ndarray,
 
 
 def fit_type_posterior(y3: np.ndarray, d2: np.ndarray, p_fake: np.ndarray,
-                       semi_prior: float = 0.05, q_min: float = 1e-3) -> dict:
+                       semi_prior: float = 0.05, q_min: float = 1e-3,
+                       allow_semi_suppression: bool = False) -> dict:
     """Fit q = clamp(sigmoid(d2/T2 + b2), q_min, q_max), the semi-vs-syn
     posterior of the factorized 3-class export.
 
@@ -192,7 +193,15 @@ def fit_type_posterior(y3: np.ndarray, d2: np.ndarray, p_fake: np.ndarray,
          E_w[(q - 1{semi})^2] on fake rows only.
       2. q_max grid minimising nothing locally EXCEPT through the composed
          full-pool multiclass sn34 (deployment-share weights) -- the cap on
-         how wrong a confident semi call can be.
+         how wrong a confident semi call can be. Caps <= 0.5 (which make the
+         semi class unreachable) are searched only with
+         allow_semi_suppression=True.
+
+    Also returns recall_raw / recall_calibrated (per-class [real, syn, semi])
+    and semi_pred_raw / semi_pred_calibrated (argmax==semi counts) so callers
+    can report what calibration did to the semi class. Note a cap > 0.5 does
+    not guarantee semi predictions: a strongly negative b2 (low semi_prior)
+    can still leave none, which is why the counts are returned.
 
     Returns the buffers plus mc_sn34_before (q pinned at q_min == a 2-logit
     head's multiclass behaviour) and mc_sn34_after (fitted q). after <= before
@@ -213,7 +222,7 @@ def fit_type_posterior(y3: np.ndarray, d2: np.ndarray, p_fake: np.ndarray,
            "cond_brier_before": float("nan"), "cond_brier_after": float("nan"),
            "mc_sn34_before": mc_before, "mc_sn34_after": mc_before}
     if not fake.any() or t_semi.sum() == 0 or t_semi.sum() == fake.sum():
-        return out  # degenerate pool: nothing to fit, pin q
+        return out  # degenerate pool: nothing to fit, pin q (no recall keys)
 
     d2f = d2[fake]
     share = float(t_semi.mean())
@@ -235,12 +244,29 @@ def fit_type_posterior(y3: np.ndarray, d2: np.ndarray, p_fake: np.ndarray,
 
     q_all = _sigmoid(d2 / T2 + B2)
     best_q = (mc_before, q_min)
-    for qm in np.linspace(0.2, 0.95, 16):
+    # A cap q_max <= 0.5 makes p*q <= p*(1-q) for every row, so semisynthetic
+    # can never win the argmax (at exactly 0.5 the tie goes to synthetic).
+    # That can still raise the local aggregate score, which is how the old
+    # 0.2-0.95 grid picked it -- and it silently zeroes semi recall on chain.
+    # Excluded unless the caller explicitly opts in.
+    grid = np.linspace(0.2, 0.95, 16)
+    if not allow_semi_suppression:
+        grid = grid[grid > 0.5 + 1e-6]
+    for qm in grid:
         P = compose_3class(p_fake, np.clip(q_all, q_min, qm))
         mc = multiclass_metrics(y3, P, w3)["mc_sn34"]
         if mc > best_q[0]:
             best_q = (mc, float(qm))
     out["mc_sn34_after"], out["q_max"] = best_q
+
+    # What calibration does to each class, so an export can say so out loud.
+    # raw = the model's own type margin, uncapped (T2=1, b2=0).
+    for tag, q in (("raw", _sigmoid(d2)),
+                   ("calibrated", np.clip(q_all, q_min, out["q_max"])),
+                   ("pinned", np.full(len(y3), q_min))):
+        P = compose_3class(p_fake, q)
+        out[f"recall_{tag}"] = multiclass_metrics(y3, P)["per_class_recall"]
+        out[f"semi_pred_{tag}"] = int((P.argmax(axis=1) == 2).sum())
     return out
 
 

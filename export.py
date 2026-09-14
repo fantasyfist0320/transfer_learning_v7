@@ -39,7 +39,7 @@ import yaml
 
 from branches import resolve, fusion_weights
 from calibrate import (deploy_p_fake, fit_temperature, fit_type_posterior,
-                       set_deploy_prior)
+                       set_deploy_prior, y3_class_weights)
 from data import ManifestDataset, ViewConfig, worker_init_fn
 from model import BranchModel, binary_margin, type_margin
 from allowlist import render_template, scan_allowlist
@@ -176,10 +176,16 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--no-refit-temperature", action="store_true")
-    ap.add_argument("--calib-splits", default="val_id,val_xgen,val_stress",
-                    help="comma-joined splits the T0/type fit runs on. The "
-                         "default keeps the historical behaviour (all three "
-                         "val pools). Pass val_id,val_xgen for the "
+    ap.add_argument("--allow-semi-suppression", action="store_true",
+                    help="let the type fit choose q_max <= 0.5, which makes "
+                         "the semisynthetic class unreachable by argmax. Off "
+                         "by default: it can raise the local aggregate score "
+                         "while zeroing semi recall on chain.")
+    ap.add_argument("--calib-splits", default=None,
+                    help="comma-joined splits the T0/type fit runs on. "
+                         "Default: val_cal when the manifest has it "
+                         "(build_splits --val-cal-frac), else the historical "
+                         "val_id,val_xgen,val_stress. Pass val_id,val_xgen for the "
                          "no-degradation experiment arms: their val_stress IS "
                          "the zero-shot judgment set (gemini31), and fitting "
                          "temperature on the judged pool leaks it into the "
@@ -389,13 +395,32 @@ def main() -> None:
     if fit_T0 or fit_type:
         df = pd.read_parquet(args.manifest)
         view = ViewConfig(image_size=image_size)
+        if args.calib_splits is None:
+            # val_cal exists only when build_splits ran with --val-cal-frac:
+            # rows checkpoint selection never scored, so calibration is not
+            # fitted on the same rows that picked the checkpoint.
+            args.calib_splits = ("val_cal" if (df.split == "val_cal").any()
+                                 else "val_id,val_xgen,val_stress")
         calib_splits = [s.strip() for s in args.calib_splits.split(",")
                         if s.strip()]
-        bad = set(calib_splits) - {"val_id", "val_xgen", "val_stress"}
+        allowed = {"val_id", "val_cal", "val_xgen", "val_stress"}
+        bad = set(calib_splits) - allowed
         if bad or not calib_splits:
             raise SystemExit(f"--calib-splits: unknown split(s) {sorted(bad)}; "
-                             f"choose from val_id,val_xgen,val_stress")
+                             f"choose from {','.join(sorted(allowed))}")
+        if "val_id" in calib_splits and (df.split == "val_cal").any():
+            print("[export] WARNING calibrating on val_id although val_cal "
+                  "exists: these are the rows checkpoint selection scored")
         sub = df[df.split.isin(calib_splits)].reset_index(drop=True)
+        if sub.empty:
+            raise SystemExit(f"--calib-splits {args.calib_splits}: no rows")
+        # One semi share for BOTH fits: the binary T0 fit and the type fit
+        # weight the pool to the same real / synthetic / semisynthetic target,
+        # so T0 is not tuned for a different fake-half mix than q.
+        prior = args.type_prior
+        if prior is None:
+            fake_ds = df[df.label == 1].drop_duplicates("dataset")
+            prior = float((fake_ds["kind"] == "semisynthetic").mean())
         # The tee'd log must prove what the fit saw: a val_stress that holds
         # a zero-shot judgment set must never silently enter the calibration.
         print(f"[export] calibration fit splits: {','.join(calib_splits)} "
@@ -413,7 +438,9 @@ def main() -> None:
         d_dep = (D_dep * fw).sum(axis=1)
         d_rob = (D_rob * fw).sum(axis=1)
         if fit_T0:
-            cal = fit_temperature(y, d_dep, d_rob)
+            w_T = (y3_class_weights(y3, prior)
+                   if len(set(np.asarray(y3).tolist())) == 3 else None)
+            cal = fit_temperature(y, d_dep, d_rob, w=w_T)
             T = float(cal["temperature"])
             s_dep = np.sqrt(((D_dep - d_dep[:, None]) ** 2 * fw).sum(axis=1))
             s_rob = np.sqrt(((D_rob - d_rob[:, None]) ** 2 * fw).sum(axis=1))
@@ -435,14 +462,12 @@ def main() -> None:
             # --override-temperature path too; T here is whatever was selected
             # above, fitted or overridden, so q is fitted against the SAME
             # binary calibration the export actually ships.
-            prior = args.type_prior
-            if prior is None:
-                fake_ds = df[df.label == 1].drop_duplicates("dataset")
-                prior = float((fake_ds["kind"] == "semisynthetic").mean())
             d2_dep = (D2_dep * fw).sum(axis=1)
             p_fake = np.clip(1.0 / (1.0 + np.exp(-d_dep / T)),
                              1e-6, 1.0 - 1e-6)
-            tp = fit_type_posterior(y3, d2_dep, p_fake, semi_prior=prior)
+            tp = fit_type_posterior(
+                y3, d2_dep, p_fake, semi_prior=prior,
+                allow_semi_suppression=args.allow_semi_suppression)
             print(f"[export] type posterior: T2={tp['type_temperature']:.3f} "
                   f"b2={tp['type_bias']:.3f} q_max={tp['q_max']:.2f} "
                   f"(prior={prior:.4f}, cond-brier "
@@ -457,6 +482,28 @@ def main() -> None:
             else:
                 print("[export] fitted q does NOT beat pinned q locally -- "
                       "shipping binary-equivalent (q pinned at q_min)")
+            if "recall_raw" in tp:
+                n_semi = int((np.asarray(y3) == 2).sum())
+                # "calibrated" = what actually ships: the fitted q, or the
+                # pinned q when the fit lost to it.
+                tag = "calibrated" if type_fitted else "pinned"
+                rr, rc = tp["recall_raw"], tp[f"recall_{tag}"]
+                sp_c = tp[f"semi_pred_{tag}"]
+                print(f"[export] class recall on the calibration pool "
+                      f"(real / synthetic / semi, n_semi={n_semi:,}): raw "
+                      f"{rr[0]:.3f} / {rr[1]:.3f} / {rr[2]:.3f} "
+                      f"({tp['semi_pred_raw']:,} semi calls) -> calibrated "
+                      f"{rc[0]:.3f} / {rc[1]:.3f} / {rc[2]:.3f} "
+                      f"({sp_c:,} semi calls)")
+                if tp["semi_pred_raw"] > 0 and sp_c == 0:
+                    print("[export] WARNING calibration ELIMINATES semisynthetic "
+                          "predictions: the raw model calls "
+                          f"{tp['semi_pred_raw']:,} rows semi, the shipped "
+                          "export calls none. Semi recall on chain will be 0.")
+                elif rr[2] > 0 and rc[2] < 0.5 * rr[2]:
+                    print(f"[export] WARNING calibration more than halves semi "
+                          f"recall ({rr[2]:.3f} -> {rc[2]:.3f}); prior="
+                          f"{prior:.4f} pushes typing toward synthetic.")
     if args.binary_equivalent:
         print("[export] --binary-equivalent: q pinned at q_min, no type fit")
     if not type_fitted and not args.binary_equivalent:
